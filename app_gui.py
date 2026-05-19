@@ -2,42 +2,102 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
+import sys
 import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import numpy as np
 
 from camera_opencv import OpenCVCamera
 from focus_metrics import auto_select_rois, calculate_focus_index
-from stage_controller import StageController, StageControllerError
+from stage_controller import StageController
 
 
 LOG = logging.getLogger(__name__)
 
 
+def list_serial_port_names() -> list[str]:
+    try:
+        from serial.tools import list_ports
+    except Exception:
+        LOG.exception("failed to import pyserial list_ports")
+        return []
+    return [port.device for port in list_ports.comports()]
+
+
+def default_serial_port() -> str:
+    if sys.platform.startswith("win"):
+        return "COM5"
+    return ""
+
+
+def serial_port_choices() -> list[str]:
+    ports = list_serial_port_names()
+    if sys.platform.startswith("win"):
+        defaults = [f"COM{i}" for i in range(3, 10)]
+        return list(dict.fromkeys(ports + defaults))
+    return ports
+
+
+@dataclass
+class ManualFocusAssistState:
+    recording: bool = False
+    best_focus_index: float | None = None
+    best_z_abs: int | None = None
+    best_z_rel: int | None = None
+    best_timestamp: float | None = None
+
+    def reset_best(self, keep_recording: bool) -> None:
+        self.recording = keep_recording
+        self.best_focus_index = None
+        self.best_z_abs = None
+        self.best_z_rel = None
+        self.best_timestamp = None
+
+    def record_sample(self, focus_index: float, z_abs: int, z_rel: int, timestamp: float | None = None) -> bool:
+        if not self.recording:
+            return False
+        if timestamp is None:
+            timestamp = time.time()
+        if self.best_focus_index is None or self._is_meaningful_improvement(focus_index):
+            self.best_focus_index = float(focus_index)
+            self.best_z_abs = int(z_abs)
+            self.best_z_rel = int(z_rel)
+            self.best_timestamp = float(timestamp)
+            return True
+        return False
+
+    def _is_meaningful_improvement(self, focus_index: float) -> bool:
+        if self.best_focus_index is None:
+            return True
+        return focus_index > self.best_focus_index * 1.01 or focus_index > self.best_focus_index + 0.5
+
+
 class ProbeStationApp(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, enable_focus_assist: bool = True, enable_autofocus: bool = False) -> None:
         super().__init__()
         self.title("Three-Axis Probe Station")
         self.geometry("1180x760")
         self.minsize(980, 640)
 
+        self.enable_focus_assist = enable_focus_assist
+        self.enable_autofocus = enable_autofocus
         self.controller: StageController | None = None
         self.camera = OpenCVCamera()
         self.device_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self.absolute_pos = {"X": 0, "Y": 0, "Z": 0}
+        self.position_available = {"X": False, "Y": False, "Z": False}
         self.software_origin = {"X": 0, "Y": 0, "Z": 0}
         self.focus_history: list[float] = []
         self.focus_z_history: list[int] = []
         self.focus_rois = None
-        self.focus_assist_active = False
-        self.best_focus_index = 0.0
-        self.best_focus_z: int | None = None
+        self.manual_focus_assist = ManualFocusAssistState()
         self._photo = None
         self._last_frame_time = 0.0
         self._position_poll_running = False
@@ -62,15 +122,22 @@ class ProbeStationApp(tk.Tk):
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
 
-        self.port_var = tk.StringVar(value="COM5")
+        self.port_var = tk.StringVar(value=default_serial_port())
         self.camera_index_var = tk.StringVar(value="0")
         self.step_var = tk.StringVar(value="100")
         self.speed_var = tk.StringVar(value="10")
-        self.status_var = tk.StringVar(value="Ready. Software emergency stop is not a substitute for physical E-stop.")
+        self.status_var = tk.StringVar(value="Ready. 软件急停不能替代物理急停。")
         self.motor_status_var = tk.StringVar(value="Motor: disconnected")
         self.camera_status_var = tk.StringVar(value="Camera: not opened")
         self.focus_var = tk.StringVar(value="Focus index: 0.00")
-        self.best_focus_var = tk.StringVar(value="Best Z: --")
+        self.current_z_abs_var = tk.StringVar(value="Current Z absolute: waiting")
+        self.current_z_rel_var = tk.StringVar(value="Current Z relative: waiting")
+        self.best_focus_var = tk.StringVar(value="Best focus index: --")
+        self.best_z_abs_var = tk.StringVar(value="Best Z absolute: --")
+        self.best_z_rel_var = tk.StringVar(value="Best Z relative: --")
+        self.best_focus_time_var = tk.StringVar(value="Best focus time: --")
+        self.focus_recording_var = tk.StringVar(value="Recording: no")
+        self.focus_assist_message_var = tk.StringVar(value="Open the camera, then start manual focus assist.")
         self.abs_pos_var = tk.StringVar(value="Abs X=0  Y=0  Z=0")
         self.rel_pos_var = tk.StringVar(value="Rel X=0  Y=0  Z=0")
 
@@ -78,13 +145,15 @@ class ProbeStationApp(tk.Tk):
         conn.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         conn.columnconfigure(1, weight=1)
         ttk.Label(conn, text="Serial").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(
+        self.port_combo = ttk.Combobox(
             conn,
             textvariable=self.port_var,
-            values=[f"COM{i}" for i in range(3, 9)],
+            values=serial_port_choices(),
             width=12,
-        ).grid(row=0, column=1, sticky="ew", padx=4)
+        )
+        self.port_combo.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(conn, text="Connect Motor", command=self._connect_motor).grid(row=0, column=2, padx=2)
+        ttk.Button(conn, text="Refresh Ports", command=self._refresh_serial_ports).grid(row=0, column=3, padx=2)
         ttk.Label(conn, text="Camera").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(conn, textvariable=self.camera_index_var, width=12).grid(row=1, column=1, sticky="ew", padx=4, pady=(6, 0))
         ttk.Button(conn, text="Open / Switch", command=self._open_camera).grid(row=1, column=2, padx=2, pady=(6, 0))
@@ -105,9 +174,9 @@ class ProbeStationApp(tk.Tk):
         ttk.Button(move, text="Stop Space", command=self._stop_all).grid(row=3, column=1, sticky="ew", padx=2, pady=2)
         ttk.Button(move, text="X+  D", command=lambda: self._move("X", +1)).grid(row=3, column=2, sticky="ew", padx=2, pady=2)
         ttk.Button(move, text="Y-  S", command=lambda: self._move("Y", -1)).grid(row=4, column=1, sticky="ew", pady=2)
-        ttk.Button(move, text="Z+  R", command=lambda: self._move("Z", +1)).grid(row=5, column=0, sticky="ew", padx=2, pady=(10, 2))
-        ttk.Button(move, text="Z-  F", command=lambda: self._move("Z", -1)).grid(row=5, column=2, sticky="ew", padx=2, pady=(10, 2))
-        ttk.Button(move, text="Software E-Stop", command=self._emergency_stop).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        ttk.Button(move, text="Z-  Q", command=lambda: self._move("Z", -1)).grid(row=5, column=0, sticky="ew", padx=2, pady=(10, 2))
+        ttk.Button(move, text="Z+  E", command=lambda: self._move("Z", +1)).grid(row=5, column=2, sticky="ew", padx=2, pady=(10, 2))
+        ttk.Button(move, text="Software E-Stop  Esc / X", command=self._emergency_stop).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
         ttk.Button(move, text="Set Current As Software Origin", command=self._set_software_origin).grid(
             row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0)
         )
@@ -117,15 +186,28 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(pos, textvariable=self.abs_pos_var).grid(row=0, column=0, sticky="w")
         ttk.Label(pos, textvariable=self.rel_pos_var).grid(row=1, column=0, sticky="w")
 
-        focus = ttk.LabelFrame(left, text="Manual Focus Assist", padding=8)
-        focus.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(focus, textvariable=self.focus_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(focus, textvariable=self.best_focus_var).grid(row=1, column=0, sticky="w")
-        ttk.Button(focus, text="Start Manual Focus Assist", command=self._start_focus_assist).grid(row=2, column=0, sticky="ew", pady=(8, 2))
-        ttk.Button(focus, text="Stop Manual Focus Assist", command=self._stop_focus_assist).grid(row=3, column=0, sticky="ew", pady=2)
-        ttk.Button(focus, text="Go To Best Z", command=self._go_to_best_z).grid(row=4, column=0, sticky="ew", pady=2)
-        self.curve_canvas = tk.Canvas(focus, width=280, height=90, bg="#101820", highlightthickness=0)
-        self.curve_canvas.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        if self.enable_focus_assist:
+            focus = ttk.LabelFrame(left, text="手动辅助对焦 Manual Focus Assist", padding=8)
+            focus.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+            focus.columnconfigure(0, weight=1)
+            focus.columnconfigure(1, weight=1)
+            ttk.Label(focus, textvariable=self.focus_assist_message_var, wraplength=300).grid(row=0, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.focus_var).grid(row=1, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.current_z_abs_var).grid(row=2, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.current_z_rel_var).grid(row=3, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.best_focus_var).grid(row=4, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.best_z_abs_var).grid(row=5, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.best_z_rel_var).grid(row=6, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.best_focus_time_var).grid(row=7, column=0, columnspan=2, sticky="w")
+            ttk.Label(focus, textvariable=self.focus_recording_var).grid(row=8, column=0, columnspan=2, sticky="w")
+            ttk.Button(focus, text="Start Manual Focus Assist", command=self._start_focus_assist).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 2))
+            ttk.Button(focus, text="Stop Manual Focus Assist", command=self._stop_focus_assist).grid(row=10, column=0, columnspan=2, sticky="ew", pady=2)
+            ttk.Button(focus, text="Go To Best Z", command=self._go_to_best_z).grid(row=11, column=0, sticky="ew", pady=2, padx=(0, 2))
+            ttk.Button(focus, text="Reset Best Focus", command=self._reset_best_focus).grid(row=11, column=1, sticky="ew", pady=2, padx=(2, 0))
+            self.curve_canvas = tk.Canvas(focus, width=280, height=90, bg="#101820", highlightthickness=0)
+            self.curve_canvas.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        else:
+            self.curve_canvas = None
 
         warning = ttk.Label(left, textvariable=self.status_var, wraplength=310, foreground="#8a4b00")
         warning.grid(row=4, column=0, sticky="ew")
@@ -138,16 +220,18 @@ class ProbeStationApp(tk.Tk):
         self.bind("<KeyPress-d>", lambda _e: self._move("X", +1))
         self.bind("<KeyPress-w>", lambda _e: self._move("Y", +1))
         self.bind("<KeyPress-s>", lambda _e: self._move("Y", -1))
+        self.bind("<KeyPress-q>", lambda _e: self._move("Z", -1))
+        self.bind("<KeyPress-e>", lambda _e: self._move("Z", +1))
         self.bind("<KeyPress-r>", lambda _e: self._move("Z", +1))
         self.bind("<KeyPress-f>", lambda _e: self._move("Z", -1))
         self.bind("<space>", lambda _e: self._stop_all())
-        self.bind("<KeyPress-e>", lambda _e: self._emergency_stop())
+        self.bind("<KeyPress-x>", lambda _e: self._emergency_stop())
         self.bind("<Escape>", lambda _e: self._emergency_stop())
 
     def _connect_motor(self) -> None:
         port = self.port_var.get().strip()
         if not port:
-            self._set_status("Serial port is empty.")
+            self._set_status("Serial port is empty. Click Refresh Ports or type the controller port.")
             return
         self._set_status(f"Opening motor controller on {port}...")
 
@@ -166,6 +250,20 @@ class ProbeStationApp(tk.Tk):
                 self.device_queue.put(("error", f"Motor connection failed: {exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_serial_ports(self) -> None:
+        choices = serial_port_choices()
+        self.port_combo.configure(values=choices)
+        if self.port_var.get().strip() and self.port_var.get().strip() in choices:
+            self._set_status("Serial ports refreshed.")
+            return
+        if sys.platform.startswith("win"):
+            self.port_var.set("COM5")
+        elif choices:
+            self.port_var.set("")
+        self._set_status(
+            "Serial ports refreshed. Select the motor controller port before connecting."
+        )
 
     def _open_camera(self) -> None:
         try:
@@ -220,7 +318,7 @@ class ProbeStationApp(tk.Tk):
             self.device_queue.put(("error", f"Controlled stop failed: {exc}"))
 
     def _emergency_stop(self) -> None:
-        self._set_status("SOFTWARE emergency stop sent. This does not replace the physical E-stop.")
+        self._set_status("SOFTWARE emergency stop sent. 软件急停不能替代物理急停。")
         if not self.controller or not self.controller.is_open:
             return
 
@@ -239,39 +337,64 @@ class ProbeStationApp(tk.Tk):
         self._set_status("Software origin set locally. No D3 clear command was sent.")
 
     def _start_focus_assist(self) -> None:
-        self.focus_assist_active = True
-        self.best_focus_index = 0.0
-        self.best_focus_z = None
+        self.manual_focus_assist.reset_best(keep_recording=True)
         self.focus_history.clear()
         self.focus_z_history.clear()
         self._draw_focus_curve()
-        self.best_focus_var.set("Best Z: --")
+        self._refresh_focus_assist_labels()
+        if not self.camera.is_open:
+            LOG.warning("camera not opened while starting manual focus assist")
+            self.focus_assist_message_var.set("相机未打开，无法进行 focus assist")
         self._set_status("Manual focus assist started. Move Z manually to collect focus samples.")
 
     def _stop_focus_assist(self) -> None:
-        self.focus_assist_active = False
+        self.manual_focus_assist.recording = False
+        self._refresh_focus_assist_labels()
         self._set_status("Manual focus assist stopped.")
 
+    def _reset_best_focus(self) -> None:
+        self.manual_focus_assist.reset_best(keep_recording=self.manual_focus_assist.recording)
+        self.focus_history.clear()
+        self.focus_z_history.clear()
+        self._draw_focus_curve()
+        self._refresh_focus_assist_labels()
+        self._set_status("Manual focus best record reset.")
+
     def _go_to_best_z(self) -> None:
-        if self.best_focus_z is None:
+        best_z_abs = self.manual_focus_assist.best_z_abs
+        if best_z_abs is None:
             self._set_status("No best Z recorded yet.")
             return
         if not self.controller or not self.controller.is_open:
             self._set_status("Motor is not connected.")
             return
-        delta = self.best_focus_z - self.absolute_pos["Z"]
+        if not self.position_available["Z"]:
+            LOG.error("Z position unavailable; cannot go to best Z")
+            self._set_status("Current Z position is unavailable; cannot Go To Best Z.")
+            return
+        confirmed = messagebox.askokcancel(
+            "Confirm Go To Best Z",
+            "即将移动 Z 轴回到记录的最佳焦点位置。请确认样品/探针/镜头安全，物理急停可用。\n\n"
+            "软件急停不能替代物理急停。",
+        )
+        if not confirmed:
+            self._set_status("Go To Best Z cancelled.")
+            return
+        delta = best_z_abs - self.absolute_pos["Z"]
         if delta == 0:
             self._set_status("Already at recorded best Z.")
             return
         direction = 1 if delta > 0 else -1
         pulses = abs(delta)
-        speed = min(10, max(1, self._read_speed()))
+        speed = min(self._read_speed(default=2), 5)
+        LOG.info("Go To Best Z started: current=%s best=%s delta=%s speed=%s", self.absolute_pos["Z"], best_z_abs, delta, speed)
 
         def worker() -> None:
             try:
                 self.controller.move_relative("Z", direction, pulses, speed)
                 positions = self._safe_read_positions(self.controller)
                 self.device_queue.put(("positions", positions))
+                LOG.info("Go To Best Z completed")
                 self.device_queue.put(("status", "Moved to recorded best Z."))
             except Exception as exc:
                 LOG.exception("go to best z failed")
@@ -279,11 +402,11 @@ class ProbeStationApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _read_speed(self) -> int:
+    def _read_speed(self, default: int = 10) -> int:
         try:
             return max(1, min(100, int(float(self.speed_var.get()))))
         except ValueError:
-            return 10
+            return default
 
     def _safe_read_positions(self, controller: StageController) -> dict[str, int]:
         try:
@@ -325,18 +448,36 @@ class ProbeStationApp(tk.Tk):
 
     def _update_focus(self, focus_index: float) -> None:
         self.focus_var.set(f"Focus index: {focus_index:.2f}")
-        if not self.focus_assist_active:
+        if not self.enable_focus_assist:
+            return
+        if not self.manual_focus_assist.recording:
+            self._refresh_focus_assist_labels()
+            return
+        if not self.camera.is_open:
+            LOG.warning("camera not opened while trying to record focus")
+            self.focus_assist_message_var.set("相机未打开，无法进行 focus assist")
+            return
+        if not self.position_available["Z"]:
+            LOG.warning("Z position unavailable while trying to record focus")
+            self.focus_assist_message_var.set("等待 Z 位置")
+            self._refresh_focus_assist_labels()
             return
         z = self.absolute_pos["Z"]
+        z_rel = z - self.software_origin["Z"]
         self.focus_history.append(float(focus_index))
         self.focus_z_history.append(z)
         if len(self.focus_history) > 240:
             self.focus_history = self.focus_history[-240:]
             self.focus_z_history = self.focus_z_history[-240:]
-        if focus_index > self.best_focus_index:
-            self.best_focus_index = float(focus_index)
-            self.best_focus_z = z
-            self.best_focus_var.set(f"Best Z: {z}  Focus: {focus_index:.2f}")
+        if self.manual_focus_assist.record_sample(float(focus_index), z_abs=z, z_rel=z_rel):
+            LOG.info(
+                "best focus updated: focus=%.2f z_abs=%s z_rel=%s",
+                self.manual_focus_assist.best_focus_index,
+                self.manual_focus_assist.best_z_abs,
+                self.manual_focus_assist.best_z_rel,
+            )
+        self.focus_assist_message_var.set("Recording manual focus samples.")
+        self._refresh_focus_assist_labels()
         self._draw_focus_curve()
 
     def _show_frame(self, frame) -> None:
@@ -366,10 +507,20 @@ class ProbeStationApp(tk.Tk):
 
     def _draw_focus_curve(self) -> None:
         canvas = self.curve_canvas
+        if canvas is None:
+            return
         canvas.delete("all")
         width = max(10, canvas.winfo_width())
         height = max(10, canvas.winfo_height())
         canvas.create_rectangle(0, 0, width, height, fill="#101820", outline="")
+        if self.manual_focus_assist.recording and self.manual_focus_assist.best_focus_index is not None:
+            canvas.create_text(
+                8,
+                8,
+                anchor="nw",
+                fill="#e6edf3",
+                text=f"Best {self.manual_focus_assist.best_focus_index:.2f}",
+            )
         if len(self.focus_history) < 2:
             return
         values = np.asarray(self.focus_history, dtype=np.float64)
@@ -395,10 +546,12 @@ class ProbeStationApp(tk.Tk):
                     self.motor_status_var.set(f"Motor: connected {controller.port}")
                     if positions:
                         self.absolute_pos.update(positions)
+                        self._mark_positions_available(positions)
                         self._update_position_labels()
                     self._set_status("Motor connected. D4 realtime upload disable was sent.")
                 elif kind == "positions":
                     self.absolute_pos.update(payload)
+                    self._mark_positions_available(payload)
                     self._update_position_labels()
                 elif kind == "position_poll_done":
                     self._position_poll_running = False
@@ -416,6 +569,42 @@ class ProbeStationApp(tk.Tk):
             f"Abs X={self.absolute_pos['X']}  Y={self.absolute_pos['Y']}  Z={self.absolute_pos['Z']}"
         )
         self.rel_pos_var.set(f"Rel X={rel['X']}  Y={rel['Y']}  Z={rel['Z']}")
+        self._refresh_focus_assist_labels()
+
+    def _mark_positions_available(self, positions: dict[str, int]) -> None:
+        for axis in positions:
+            if axis in self.position_available:
+                self.position_available[axis] = True
+
+    def _refresh_focus_assist_labels(self) -> None:
+        if not self.enable_focus_assist:
+            return
+        state = self.manual_focus_assist
+        if self.position_available["Z"]:
+            z_abs = self.absolute_pos["Z"]
+            z_rel = z_abs - self.software_origin["Z"]
+            self.current_z_abs_var.set(f"Current Z absolute: {z_abs}")
+            self.current_z_rel_var.set(f"Current Z relative: {z_rel}")
+        else:
+            self.current_z_abs_var.set("Current Z absolute: waiting")
+            self.current_z_rel_var.set("Current Z relative: waiting")
+
+        self.focus_recording_var.set(f"Recording: {'yes' if state.recording else 'no'}")
+        if state.best_focus_index is None:
+            self.best_focus_var.set("Best focus index: --")
+            self.best_z_abs_var.set("Best Z absolute: --")
+            self.best_z_rel_var.set("Best Z relative: --")
+            self.best_focus_time_var.set("Best focus time: --")
+            return
+
+        self.best_focus_var.set(f"Best focus index: {state.best_focus_index:.2f}")
+        self.best_z_abs_var.set(f"Best Z absolute: {state.best_z_abs}")
+        self.best_z_rel_var.set(f"Best Z relative: {state.best_z_rel}")
+        if state.best_timestamp is None:
+            self.best_focus_time_var.set("Best focus time: --")
+        else:
+            time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.best_timestamp))
+            self.best_focus_time_var.set(f"Best focus time: {time_text}")
 
     def _set_status(self, message: str) -> None:
         LOG.info(message)

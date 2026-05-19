@@ -53,6 +53,20 @@ uv run python main.py
 The main window appears first. It does not scan cameras or open the motor controller at startup.
 Runtime errors are written to `debug.log` beside `main.py`.
 
+### 4. Run Stage 2 Manual Focus Assist
+
+Stage 2 uses the same GUI code, with manual focus assist enabled and automatic autofocus disabled:
+
+```bat
+python main_stage2_focus_assist.py
+```
+
+If you are using `uv`, run:
+
+```bat
+uv run probe-station-stage2
+```
+
 ## Updating Dependencies
 
 After editing `pyproject.toml`, run:
@@ -88,9 +102,36 @@ use the uv workflow above.
 5. Test `X+`, `X-`, `Y+`, `Y-`, `Z+`, and `Z-` one at a time.
 6. Confirm that GUI `X+` and `X-` match the desired lab-coordinate direction. The controller direction for X is intentionally inverted in software.
 7. Test `Space` for controlled stop.
-8. Test `E` or `Esc` for software emergency stop while keeping the physical emergency stop ready.
+8. Test `Esc` for software emergency stop while keeping the physical emergency stop ready.
 9. Open the camera only after motor startup is stable. If the camera cannot open, the GUI remains in no-camera mode.
 10. Start `Manual Focus Assist`, move Z manually, and use `Go To Best Z` only after confirming Z motion direction and step size.
+
+## Keyboard Shortcuts
+
+- `A` / `D` = X- / X+
+- `W` / `S` = Y+ / Y-
+- `Q` / `E` = Z- / Z+
+- `R` / `F` = Z+ / Z- compatibility backup
+- `Space` = all-axis decelerated stop
+- `Esc` = software emergency stop
+- `X` = backup software emergency stop
+
+`E` is now Z+ only. It is not software emergency stop.
+
+## Stage 2 Manual Focus Assist Workflow
+
+1. Run Stage 1 first and confirm that motor motion and the camera both work normally.
+2. Run Stage 2 with `python main_stage2_focus_assist.py`.
+3. Manually move to the target area.
+4. Open the camera.
+5. Click `Start Manual Focus Assist`.
+6. Use `Q` / `E` with a small step size to move Z manually.
+7. Watch `focus index`, current Z, and best focus values.
+8. Click `Stop Manual Focus Assist` when you are done recording.
+9. If needed, click `Go To Best Z`. Confirm the safety dialog before the GUI moves Z back to the recorded best absolute Z.
+10. If anything looks wrong, immediately press `Esc` or use the physical emergency stop.
+
+Stage 2 does not perform automatic focus scanning. It only records focus quality while the operator moves Z manually.
 
 ## Safety Notes
 
@@ -98,7 +139,7 @@ use the uv workflow above.
 - The stage has only X/Y/Z in this software. Controller A-axis support is ignored.
 - Do not use hardware home command `D0`; there are currently no limit or home sensors.
 - `Set Current As Software Origin` only changes local relative coordinates. It does not send `D3` software clear to the controller.
-- Software emergency stop is retained, but it cannot replace a physical emergency stop.
+- Software emergency stop is retained, but it cannot replace a physical emergency stop. 软件急停不能替代物理急停。
 - Keep default motion low-speed and small-step for first tests.
 
 ## Module Layout
@@ -109,6 +150,7 @@ use the uv workflow above.
 - `focus_metrics.py`: ROI selection and robust focus index calculation.
 - `app_gui.py`: Tkinter GUI, keyboard shortcuts, camera display via PPM `PhotoImage`, manual focus assist.
 - `main.py`: logging and GUI startup only.
+- `main_stage2_focus_assist.py`: Stage 2 startup with `enable_focus_assist=True` and `enable_autofocus=False`.
 
 ## Controller Protocol
 
@@ -121,4 +163,4 @@ use the uv workflow above.
 - Relative movement uses `FA` with per-command speed percent.
 - Movement completion waits for `B5` on the commanded axis before refreshing position.
 - `Space` sends `FC FF 4A...` for all-axis decelerated stop.
-- `E` and `Esc` send `FC FF 49...` for all-axis software emergency stop.
+- `Esc` and backup `X` send `FC FF 49...` for all-axis software emergency stop.
