@@ -2,23 +2,82 @@
 
 Clean first-pass Python project for a Windows lab computer controlling a three-axis X/Y/Z probe station.
 
-## Install
+## Install With uv On Windows
+
+This project is configured around `uv`, which creates and manages the Python
+virtual environment from `pyproject.toml`.
+
+### 1. Install uv
 
 ```bat
-cd probe_station
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-## Run
+Close and reopen Command Prompt or PowerShell after installation so `uv` is on
+`PATH`. Check it with:
 
 ```bat
-python main.py
+uv --version
+```
+
+### 2. Create The Virtual Environment
+
+From the project folder:
+
+```bat
+cd probe-station
+uv sync
+```
+
+`uv sync` reads `.python-version` and `pyproject.toml`, then creates `.venv`
+with Python 3.11 and installs:
+
+- `pyserial` for the motor controller serial port
+- `opencv-python` for the USB camera
+- `numpy` for image and focus calculations
+
+### 3. Run The App
+
+Recommended:
+
+```bat
+uv run probe-station
+```
+
+Equivalent direct command:
+
+```bat
+uv run python main.py
 ```
 
 The main window appears first. It does not scan cameras or open the motor controller at startup.
 Runtime errors are written to `debug.log` beside `main.py`.
+
+## Updating Dependencies
+
+After editing `pyproject.toml`, run:
+
+```bat
+uv sync
+```
+
+If you need a traditional activated shell for debugging:
+
+```bat
+.venv\Scripts\activate
+python main.py
+```
+
+Deactivate it with:
+
+```bat
+deactivate
+```
+
+## Legacy pip Install
+
+`requirements.txt` is kept for older setups, but new Windows computers should
+use the uv workflow above.
 
 ## First Real-Hardware Test
 

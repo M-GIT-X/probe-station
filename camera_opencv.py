@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Optional
 
-import cv2
+try:
+    import cv2
+except ImportError:  # pragma: no cover - depends on local optional dependency
+    cv2 = None
 
 
 LOG = logging.getLogger(__name__)
@@ -27,8 +31,12 @@ class OpenCVCamera:
     def open(self, index: int) -> bool:
         self.close()
         self.index = int(index)
+        if cv2 is None:
+            LOG.warning("OpenCV is not installed; entering no-camera mode")
+            return False
         try:
-            capture = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+            backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
+            capture = cv2.VideoCapture(self.index, backend)
             if not capture.isOpened():
                 capture.release()
                 capture = cv2.VideoCapture(self.index)
@@ -53,6 +61,8 @@ class OpenCVCamera:
         self._capture = None
 
     def read_frame(self):
+        if cv2 is None:
+            raise CameraError("OpenCV is not installed")
         if not self.is_open:
             raise CameraError("camera is not open")
         ok, frame = self._capture.read()

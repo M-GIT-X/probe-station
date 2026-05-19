@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - depends on local optional dependency
+    cv2 = None
+
+
+def _require_cv2():
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for focus metrics")
+    return cv2
 
 
 def auto_select_rois(frame) -> list[tuple[int, int, int, int]]:
+    cv = _require_cv2()
     height, width = frame.shape[:2]
     roi_w = max(32, width // 7)
     roi_h = max(32, height // 7)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
 
     candidates: list[tuple[float, tuple[int, int, int, int]]] = []
     for row in range(5):
@@ -25,8 +36,8 @@ def auto_select_rois(frame) -> list[tuple[int, int, int, int]]:
 
             contrast = float(patch.std())
             brightness = float(patch.mean())
-            lap_var = float(cv2.Laplacian(patch, cv2.CV_64F).var())
-            edges = cv2.Canny(patch, 60, 140)
+            lap_var = float(cv.Laplacian(patch, cv.CV_64F).var())
+            edges = cv.Canny(patch, 60, 140)
             edge_density = float(np.mean(edges > 0))
             saturation = 0.0
             if frame.ndim == 3:
@@ -63,6 +74,7 @@ def auto_select_rois(frame) -> list[tuple[int, int, int, int]]:
 def calculate_focus_index(frame, rois: list[tuple[int, int, int, int]] | None = None) -> float:
     if frame is None:
         return 0.0
+    cv = _require_cv2()
     if rois is None:
         rois = auto_select_rois(frame)
 
@@ -71,11 +83,11 @@ def calculate_focus_index(frame, rois: list[tuple[int, int, int, int]] | None = 
         patch = frame[y : y + height, x : x + width]
         if patch.size == 0:
             continue
-        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
+        gray = cv.cvtColor(patch, cv.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
 
-        laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        laplacian_var = float(cv.Laplacian(gray, cv.CV_64F).var())
+        sobel_x = cv.Sobel(gray, cv.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv.Sobel(gray, cv.CV_64F, 0, 1, ksize=3)
         tenengrad = float(np.mean(sobel_x * sobel_x + sobel_y * sobel_y))
         contrast = float(gray.std())
         brightness = float(gray.mean())

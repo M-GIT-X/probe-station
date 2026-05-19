@@ -9,7 +9,6 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-import cv2
 import numpy as np
 
 from camera_opencv import OpenCVCamera
@@ -341,6 +340,13 @@ class ProbeStationApp(tk.Tk):
         self._draw_focus_curve()
 
     def _show_frame(self, frame) -> None:
+        try:
+            import cv2
+        except ImportError:
+            self.camera_status_var.set("Camera: OpenCV is not installed")
+            self.camera.close()
+            return
+
         now = time.monotonic()
         if now - self._last_frame_time < 0.04:
             return

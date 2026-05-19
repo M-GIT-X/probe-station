@@ -1,0 +1,28 @@
+[project]
+name = "probe-station"
+version = "0.1.0"
+description = "Tkinter GUI for a three-axis automated probe station."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pyserial",
+]
+
+[project.scripts]
+probe-station = "main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "app_gui",
+    "camera_opencv",
+    "focus_metrics",
+    "main",
+    "stage_controller",
+    "stage_protocol",
+]
