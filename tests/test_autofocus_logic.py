@@ -1,0 +1,67 @@
+import unittest
+
+from app_gui import (
+    AutofocusParams,
+    AutofocusSamplePoint,
+    build_scan_offsets,
+    clamp_autofocus_params,
+    logical_direction_to_controller_direction,
+    select_final_autofocus_point,
+)
+
+
+class DirectionMappingTest(unittest.TestCase):
+    def test_xy_are_inverted_and_z_is_not(self):
+        self.assertEqual(logical_direction_to_controller_direction("X", +1), -1)
+        self.assertEqual(logical_direction_to_controller_direction("X", -1), +1)
+        self.assertEqual(logical_direction_to_controller_direction("Y", +1), -1)
+        self.assertEqual(logical_direction_to_controller_direction("Y", -1), +1)
+        self.assertEqual(logical_direction_to_controller_direction("Z", +1), +1)
+        self.assertEqual(logical_direction_to_controller_direction("Z", -1), -1)
+
+
+class AutofocusLogicTest(unittest.TestCase):
+    def test_safe_mode_clamps_autofocus_params(self):
+        params = AutofocusParams(
+            scan_range=500,
+            scan_step=100,
+            autofocus_speed=20,
+            settle_seconds=0.5,
+            sample_seconds=1.5,
+            near_best_ratio=0.96,
+        )
+
+        clamped, changed = clamp_autofocus_params(params)
+
+        self.assertTrue(changed)
+        self.assertEqual(clamped.scan_range, 100)
+        self.assertEqual(clamped.scan_step, 20)
+        self.assertEqual(clamped.autofocus_speed, 5)
+
+    def test_scan_offsets_include_positive_range_even_when_step_does_not_land_on_it(self):
+        self.assertEqual(build_scan_offsets(20, 6), [-20, -14, -8, -2, 4, 10, 16, 20])
+
+    def test_final_point_prefers_stability_inside_near_best_band(self):
+        points = [
+            AutofocusSamplePoint(offset=-10, score=90.0, iqr=1.0, frame_count=10),
+            AutofocusSamplePoint(offset=0, score=96.0, iqr=4.0, frame_count=10),
+            AutofocusSamplePoint(offset=5, score=100.0, iqr=30.0, frame_count=10),
+        ]
+
+        selected = select_final_autofocus_point(points, near_best_ratio=0.96)
+
+        self.assertEqual(selected.offset, 0)
+
+    def test_final_point_uses_smaller_abs_offset_when_stability_is_close(self):
+        points = [
+            AutofocusSamplePoint(offset=-10, score=98.0, iqr=2.0, frame_count=10),
+            AutofocusSamplePoint(offset=3, score=100.0, iqr=2.02, frame_count=10),
+        ]
+
+        selected = select_final_autofocus_point(points, near_best_ratio=0.96)
+
+        self.assertEqual(selected.offset, 3)
+
+
+if __name__ == "__main__":
+    unittest.main()

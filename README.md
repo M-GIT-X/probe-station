@@ -53,6 +53,18 @@ uv run python main.py
 The main window appears first. It does not scan cameras or open the motor controller at startup.
 Runtime errors are written to `debug.log` beside `main.py`.
 
+For the manual-only Stage 1 entry:
+
+```bat
+python main_stage1_manual.py
+```
+
+With `uv`:
+
+```bat
+uv run probe-station-stage1
+```
+
 ### 4. Run Stage 2 Manual Focus Assist
 
 Stage 2 uses the same GUI code, with manual focus assist enabled and automatic autofocus disabled:
@@ -65,6 +77,26 @@ If you are using `uv`, run:
 
 ```bat
 uv run probe-station-stage2
+```
+
+### 5. Run Stage 3 Conservative Full Scan Autofocus
+
+Stage 3 uses the same GUI and adds conservative Z-only autofocus:
+
+```bat
+python main_stage3_autofocus.py
+```
+
+If you are using `uv`, run:
+
+```bat
+uv run probe-station-stage3
+```
+
+Equivalent direct `uv` command:
+
+```bat
+uv run python main_stage3_autofocus.py
 ```
 
 ## Updating Dependencies
@@ -97,14 +129,29 @@ use the uv workflow above.
 
 1. Verify that a physical emergency stop is installed, reachable, and tested before enabling motion.
 2. Start the GUI with no devices connected and confirm the window opens quickly.
-3. Connect only the motor controller, enter the serial port such as `COM5`, and click `Connect Motor`.
+3. Connect only the motor controller, click `Refresh Ports`, select the detected motor-controller COM port, and click `Connect Motor`.
 4. Use a very small step such as `10` to `100` pulses and a low speed such as `5` to `10`.
 5. Test `X+`, `X-`, `Y+`, `Y-`, `Z+`, and `Z-` one at a time.
-6. Confirm that GUI `X+` and `X-` match the desired lab-coordinate direction. The controller direction for X is intentionally inverted in software.
+6. Confirm that GUI `X+`/`X-` and `Y+`/`Y-` match the desired lab-coordinate direction. X/Y directions are software-inverted based on real-machine testing.
 7. Test `Space` for controlled stop.
 8. Test `Esc` for software emergency stop while keeping the physical emergency stop ready.
 9. Open the camera only after motor startup is stable. If the camera cannot open, the GUI remains in no-camera mode.
 10. Start `Manual Focus Assist`, move Z manually, and use `Go To Best Z` only after confirming Z motion direction and step size.
+
+## Windows Serial Port Check
+
+If the motor does not connect, check which COM ports Windows currently sees:
+
+```bat
+uv run python -m serial.tools.list_ports -v
+```
+
+The controller port can change after unplugging USB, changing USB sockets,
+reinstalling drivers, or rebooting Windows. The GUI still prefers `COM5` when
+Windows lists it, but if `COM5` is missing and `COM3`/`COM4` are detected, pick
+the detected controller port instead. If a typed port is not currently listed by
+Windows, the GUI will stop before opening it and ask you to refresh/select a
+detected port.
 
 ## Keyboard Shortcuts
 
@@ -121,6 +168,9 @@ Axis movement shortcuts are ignored while the cursor is inside serial, camera,
 step, or speed input fields. `Space` stop and `Esc` software emergency stop
 remain available as safety controls.
 
+X/Y direction mapping is software-inverted based on real-machine testing. Z keeps
+the same direction that passed Stage 2 testing.
+
 ## Stage 2 Manual Focus Assist Workflow
 
 1. Run Stage 1 first and confirm that motor motion and the camera both work normally.
@@ -136,14 +186,43 @@ remain available as safety controls.
 
 Stage 2 does not perform automatic focus scanning. It only records focus quality while the operator moves Z manually.
 
+## Stage 3 Conservative Full Scan Autofocus Workflow
+
+Run stages in this order on real hardware:
+
+1. Run `python main_stage1_manual.py` and confirm manual movement and camera.
+2. Run `python main_stage2_focus_assist.py` and confirm manual focus assist.
+3. Run `python main_stage3_autofocus.py` only after the first two stages are stable.
+
+First real-machine Stage 3 parameters should stay conservative:
+
+- `scan_range = 20`
+- `scan_step = 5`
+- `speed = 1` or `2`
+- `settle_seconds = 0.5`
+- `sample_seconds = 1.5`
+- `near_best_ratio = 0.96`
+
+Stage 3 only moves Z. It does not perform XY scanning, snake scanning, stitching,
+multi-point measurement, or exposure control. Start near focus manually before
+pressing `Start Autofocus`; do not start from a completely defocused position.
+
+`SAFE_MODE` is enabled by default in `app_gui.py`. It clamps autofocus parameters
+to `SAFE_MAX_AUTOFOCUS_RANGE = 100`, `SAFE_MAX_AUTOFOCUS_STEP = 20`, and
+`SAFE_MAX_AUTOFOCUS_SPEED = 5`. Advanced users can edit these constants in code,
+but first tests should keep `SAFE_MODE = True`.
+
 ## Safety Notes
 
-- This first version is intentionally conservative: no automatic scan autofocus is implemented yet.
+- Stage 3 can automatically move the Z axis during conservative autofocus.
+- A person must watch the device state during every autofocus run.
+- Confirm the physical emergency stop is available before starting autofocus.
 - The stage has only X/Y/Z in this software. Controller A-axis support is ignored.
 - Do not use hardware home command `D0`; there are currently no limit or home sensors.
 - `Set Current As Software Origin` only changes local relative coordinates. It does not send `D3` software clear to the controller.
 - Software emergency stop is retained, but it cannot replace a physical emergency stop. 软件急停不能替代物理急停。
 - Keep default motion low-speed and small-step for first tests.
+- X/Y directions are software-inverted based on real-machine testing. Z direction remains unchanged from the successful Stage 2 test.
 
 ## Module Layout
 
@@ -151,9 +230,11 @@ Stage 2 does not perform automatic focus scanning. It only records focus quality
 - `stage_controller.py`: pyserial connection, reads, manual relative movement, controlled stop, and software emergency stop.
 - `camera_opencv.py`: OpenCV camera open/close/read only; no startup camera scan.
 - `focus_metrics.py`: ROI selection and robust focus index calculation.
-- `app_gui.py`: Tkinter GUI, keyboard shortcuts, camera display via PPM `PhotoImage`, manual focus assist.
+- `app_gui.py`: Tkinter GUI, keyboard shortcuts, camera display via PPM `PhotoImage`, manual focus assist, and conservative Z-only autofocus.
 - `main.py`: logging and GUI startup only.
+- `main_stage1_manual.py`: Stage 1 startup with manual controls only.
 - `main_stage2_focus_assist.py`: Stage 2 startup with `enable_focus_assist=True` and `enable_autofocus=False`.
+- `main_stage3_autofocus.py`: Stage 3 startup with `enable_focus_assist=True` and `enable_autofocus=True`.
 
 ## Controller Protocol
 

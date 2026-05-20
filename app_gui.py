@@ -14,11 +14,21 @@ from tkinter import messagebox, ttk
 import numpy as np
 
 from camera_opencv import OpenCVCamera
-from focus_metrics import auto_select_rois, calculate_focus_index
+from focus_metrics import auto_select_rois, calculate_focus_index, robust_representative
 from stage_controller import StageController
 
 
 LOG = logging.getLogger(__name__)
+
+INVERT_X_DIRECTION = True
+INVERT_Y_DIRECTION = True
+INVERT_Z_DIRECTION = False
+
+SAFE_MODE = True
+SAFE_MAX_AUTOFOCUS_RANGE = 100
+SAFE_MAX_AUTOFOCUS_STEP = 20
+SAFE_MAX_AUTOFOCUS_SPEED = 5
+MIN_SAMPLE_FRAMES = 3
 
 
 def list_serial_port_names() -> list[str]:
@@ -30,18 +40,39 @@ def list_serial_port_names() -> list[str]:
     return [port.device for port in list_ports.comports()]
 
 
+def _serial_port_sort_key(port: str) -> tuple[int, str]:
+    name = port.upper()
+    if name.startswith("COM"):
+        suffix = name[3:]
+        if suffix.isdigit():
+            return int(suffix), name
+    return 10_000, name
+
+
 def default_serial_port() -> str:
+    ports = sorted(list_serial_port_names(), key=_serial_port_sort_key)
     if sys.platform.startswith("win"):
+        if "COM5" in {port.upper() for port in ports}:
+            return "COM5"
+        if ports:
+            return ports[0]
         return "COM5"
     return ""
 
 
 def serial_port_choices() -> list[str]:
-    ports = list_serial_port_names()
+    ports = sorted(list_serial_port_names(), key=_serial_port_sort_key)
     if sys.platform.startswith("win"):
         defaults = [f"COM{i}" for i in range(3, 10)]
         return list(dict.fromkeys(ports + defaults))
     return ports
+
+
+def selected_serial_port_is_listed(port: str) -> bool:
+    detected = {name.upper() for name in list_serial_port_names()}
+    if not detected:
+        return True
+    return port.upper() in detected
 
 
 def should_ignore_axis_shortcut(widget) -> bool:
@@ -52,6 +83,112 @@ def should_ignore_axis_shortcut(widget) -> bool:
     except Exception:
         return False
     return widget_class in {"Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox"}
+
+
+def logical_direction_to_controller_direction(axis: str, logical_sign: int) -> int:
+    sign = 1 if logical_sign >= 0 else -1
+    invert_by_axis = {
+        "X": INVERT_X_DIRECTION,
+        "Y": INVERT_Y_DIRECTION,
+        "Z": INVERT_Z_DIRECTION,
+    }
+    if invert_by_axis.get(axis.upper(), False):
+        sign *= -1
+    return sign
+
+
+@dataclass(frozen=True)
+class AutofocusParams:
+    scan_range: int = 20
+    scan_step: int = 5
+    autofocus_speed: int = 2
+    settle_seconds: float = 0.5
+    sample_seconds: float = 1.5
+    near_best_ratio: float = 0.96
+
+
+@dataclass(frozen=True)
+class AutofocusSamplePoint:
+    offset: int
+    score: float
+    iqr: float
+    frame_count: int
+
+
+@dataclass
+class AutofocusRunState:
+    running: bool = False
+    stop_requested: bool = False
+    current_offset: int = 0
+    current_score: float | None = None
+    best_score: float | None = None
+    best_offset: int | None = None
+    final_offset: int | None = None
+    confirm_score: float | None = None
+    confirm_iqr: float | None = None
+    sample_points: list[AutofocusSamplePoint] | None = None
+
+    def reset(self) -> None:
+        self.running = False
+        self.stop_requested = False
+        self.current_offset = 0
+        self.current_score = None
+        self.best_score = None
+        self.best_offset = None
+        self.final_offset = None
+        self.confirm_score = None
+        self.confirm_iqr = None
+        self.sample_points = []
+
+
+def clamp_autofocus_params(params: AutofocusParams) -> tuple[AutofocusParams, bool]:
+    if not SAFE_MODE:
+        return params, False
+    clamped = AutofocusParams(
+        scan_range=min(params.scan_range, SAFE_MAX_AUTOFOCUS_RANGE),
+        scan_step=min(params.scan_step, SAFE_MAX_AUTOFOCUS_STEP),
+        autofocus_speed=min(params.autofocus_speed, SAFE_MAX_AUTOFOCUS_SPEED),
+        settle_seconds=params.settle_seconds,
+        sample_seconds=params.sample_seconds,
+        near_best_ratio=params.near_best_ratio,
+    )
+    return clamped, clamped != params
+
+
+def build_scan_offsets(scan_range: int, scan_step: int) -> list[int]:
+    scan_range = max(1, int(scan_range))
+    scan_step = max(1, int(scan_step))
+    offsets = list(range(-scan_range, scan_range + 1, scan_step))
+    if offsets[-1] != scan_range:
+        offsets.append(scan_range)
+    return offsets
+
+
+def select_final_autofocus_point(
+    points: list[AutofocusSamplePoint],
+    near_best_ratio: float,
+) -> AutofocusSamplePoint:
+    if not points:
+        raise ValueError("no autofocus points")
+    peak_score = max(point.score for point in points)
+    threshold = peak_score * near_best_ratio
+    candidates = [point for point in points if point.score >= threshold]
+    return min(
+        candidates,
+        key=lambda point: (
+            round(point.iqr / max(point.score, 1.0), 3),
+            abs(point.offset),
+            -point.score,
+        ),
+    )
+
+
+def _interquartile_range(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    data = np.asarray(values, dtype=np.float64)
+    q75, q25 = np.percentile(data, [75, 25])
+    return float(q75 - q25)
 
 
 @dataclass
@@ -99,6 +236,7 @@ class ProbeStationApp(tk.Tk):
         self.enable_autofocus = enable_autofocus
         self.controller: StageController | None = None
         self.camera = OpenCVCamera()
+        self.camera_lock = threading.Lock()
         self.device_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self.absolute_pos = {"X": 0, "Y": 0, "Z": 0}
@@ -108,17 +246,49 @@ class ProbeStationApp(tk.Tk):
         self.focus_z_history: list[int] = []
         self.focus_rois = None
         self.manual_focus_assist = ManualFocusAssistState()
+        self.autofocus = AutofocusRunState()
+        self.autofocus.reset()
         self._photo = None
         self._last_frame_time = 0.0
         self._position_poll_running = False
+        self._closing = False
+        self._after_ids: set[str] = set()
 
         self._build_ui()
         self._bind_keys()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.after(50, self._drain_device_queue)
-        self.after(80, self._camera_loop)
-        self.after(500, self._poll_positions)
+        self._schedule_after(50, self._drain_device_queue)
+        self._schedule_after(80, self._camera_loop)
+        self._schedule_after(500, self._poll_positions)
+
+    def _schedule_after(self, delay_ms: int, callback) -> None:
+        if self._closing:
+            return
+
+        after_id = ""
+
+        def wrapped_callback():
+            self._after_ids.discard(after_id)
+            if not self._closing:
+                callback()
+
+        after_id = self.after(delay_ms, wrapped_callback)
+        self._after_ids.add(after_id)
+
+    def _cancel_after_callbacks(self) -> None:
+        self._closing = True
+        for after_id in list(self._after_ids):
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            finally:
+                self._after_ids.discard(after_id)
+
+    def destroy(self) -> None:
+        self._cancel_after_callbacks()
+        super().destroy()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=0)
@@ -148,6 +318,20 @@ class ProbeStationApp(tk.Tk):
         self.best_focus_time_var = tk.StringVar(value="Best focus time: --")
         self.focus_recording_var = tk.StringVar(value="Recording: no")
         self.focus_assist_message_var = tk.StringVar(value="Open the camera, then start manual focus assist.")
+        self.af_scan_range_var = tk.StringVar(value="20")
+        self.af_scan_step_var = tk.StringVar(value="5")
+        self.af_speed_var = tk.StringVar(value="2")
+        self.af_settle_seconds_var = tk.StringVar(value="0.5")
+        self.af_sample_seconds_var = tk.StringVar(value="1.5")
+        self.af_near_best_ratio_var = tk.StringVar(value="0.96")
+        self.af_status_var = tk.StringVar(value="AF status: idle")
+        self.af_offset_var = tk.StringVar(value="Current offset: --")
+        self.af_score_var = tk.StringVar(value="Current sample focus index: --")
+        self.af_best_var = tk.StringVar(value="Best score: --")
+        self.af_best_offset_var = tk.StringVar(value="Best offset: --")
+        self.af_final_offset_var = tk.StringVar(value="Final offset: --")
+        self.af_confirm_score_var = tk.StringVar(value="Confirm score: --")
+        self.af_sample_count_var = tk.StringVar(value="Sample points: 0")
         self.abs_pos_var = tk.StringVar(value="Abs X=0  Y=0  Z=0")
         self.rel_pos_var = tk.StringVar(value="Rel X=0  Y=0  Z=0")
 
@@ -219,8 +403,44 @@ class ProbeStationApp(tk.Tk):
         else:
             self.curve_canvas = None
 
+        if self.enable_autofocus:
+            autofocus = ttk.LabelFrame(left, text="Conservative Full Scan Autofocus", padding=8)
+            autofocus.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+            for col in range(4):
+                autofocus.columnconfigure(col, weight=1)
+            ttk.Label(autofocus, text="Range").grid(row=0, column=0, sticky="w")
+            ttk.Entry(autofocus, textvariable=self.af_scan_range_var, width=7).grid(row=0, column=1, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Step").grid(row=0, column=2, sticky="w")
+            ttk.Entry(autofocus, textvariable=self.af_scan_step_var, width=7).grid(row=0, column=3, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Speed %").grid(row=1, column=0, sticky="w")
+            ttk.Entry(autofocus, textvariable=self.af_speed_var, width=7).grid(row=1, column=1, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Settle s").grid(row=1, column=2, sticky="w")
+            ttk.Entry(autofocus, textvariable=self.af_settle_seconds_var, width=7).grid(row=1, column=3, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Sample s").grid(row=2, column=0, sticky="w")
+            ttk.Entry(autofocus, textvariable=self.af_sample_seconds_var, width=7).grid(row=2, column=1, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Near best").grid(row=2, column=2, sticky="w")
+            ttk.Entry(autofocus, textvariable=self.af_near_best_ratio_var, width=7).grid(row=2, column=3, sticky="ew", padx=2)
+            ttk.Button(autofocus, text="Start Autofocus", command=self._start_autofocus).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 2), padx=(0, 2))
+            ttk.Button(autofocus, text="Stop Autofocus", command=self._stop_autofocus).grid(row=3, column=2, columnspan=2, sticky="ew", pady=(8, 2), padx=(2, 0))
+            labels = [
+                self.af_status_var,
+                self.af_offset_var,
+                self.af_score_var,
+                self.af_best_var,
+                self.af_best_offset_var,
+                self.af_final_offset_var,
+                self.af_confirm_score_var,
+                self.af_sample_count_var,
+            ]
+            for index, variable in enumerate(labels, start=4):
+                ttk.Label(autofocus, textvariable=variable).grid(row=index, column=0, columnspan=4, sticky="w")
+            self.af_canvas = tk.Canvas(autofocus, width=280, height=120, bg="#101820", highlightthickness=0)
+            self.af_canvas.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        else:
+            self.af_canvas = None
+
         warning = ttk.Label(left, textvariable=self.status_var, wraplength=310, foreground="#8a4b00")
-        warning.grid(row=4, column=0, sticky="ew")
+        warning.grid(row=5, column=0, sticky="ew")
 
         self.video_label = ttk.Label(right, text="No camera")
         self.video_label.grid(row=0, column=0, sticky="nsew")
@@ -248,12 +468,17 @@ class ProbeStationApp(tk.Tk):
         if not port:
             self._set_status("Serial port is empty. Click Refresh Ports or type the controller port.")
             return
+        if sys.platform.startswith("win") and not selected_serial_port_is_listed(port):
+            self._set_status(
+                f"{port} is not currently listed by Windows. Click Refresh Ports and select the detected controller port."
+            )
+            return
         self._set_status(f"Opening motor controller on {port}...")
 
         def worker() -> None:
             controller = None
             try:
-                controller = StageController(port=port)
+                controller = StageController(port=port, invert_x=False)
                 controller.open()
                 controller.test_connection()
                 positions = self._safe_read_positions(controller)
@@ -273,7 +498,7 @@ class ProbeStationApp(tk.Tk):
             self._set_status("Serial ports refreshed.")
             return
         if sys.platform.startswith("win"):
-            self.port_var.set("COM5")
+            self.port_var.set(default_serial_port())
         elif choices:
             self.port_var.set("")
         self._set_status(
@@ -297,6 +522,9 @@ class ProbeStationApp(tk.Tk):
             self._set_status("Camera could not be opened; GUI remains available.")
 
     def _move(self, axis: str, direction: int) -> None:
+        if self.autofocus.running:
+            self._set_status("Autofocus is running; manual movement is disabled except Space/Esc.")
+            return
         if not self.controller or not self.controller.is_open:
             self._set_status("Motor is not connected.")
             return
@@ -309,7 +537,8 @@ class ProbeStationApp(tk.Tk):
 
         def worker() -> None:
             try:
-                self.controller.move_relative(axis, direction, pulses, speed)
+                controller_direction = logical_direction_to_controller_direction(axis, direction)
+                self.controller.move_relative(axis, controller_direction, pulses, speed)
                 positions = self._safe_read_positions(self.controller)
                 self.device_queue.put(("positions", positions))
             except Exception as exc:
@@ -319,6 +548,10 @@ class ProbeStationApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _stop_all(self) -> None:
+        if self.autofocus.running:
+            self.autofocus.stop_requested = True
+            LOG.info("Stop Autofocus requested by Space/controlled stop")
+            self.device_queue.put(("af_status", "AF status: stop requested"))
         if not self.controller or not self.controller.is_open:
             return
         self._set_status("Sending controlled stop...")
@@ -334,6 +567,10 @@ class ProbeStationApp(tk.Tk):
 
     def _emergency_stop(self) -> None:
         self._set_status("SOFTWARE emergency stop sent. 软件急停不能替代物理急停。")
+        if self.autofocus.running:
+            self.autofocus.stop_requested = True
+            LOG.warning("Emergency Stop during AF")
+            self.device_queue.put(("af_status", "AF status: emergency stop requested"))
         if not self.controller or not self.controller.is_open:
             return
 
@@ -406,7 +643,8 @@ class ProbeStationApp(tk.Tk):
 
         def worker() -> None:
             try:
-                self.controller.move_relative("Z", direction, pulses, speed)
+                controller_direction = logical_direction_to_controller_direction("Z", direction)
+                self.controller.move_relative("Z", controller_direction, pulses, speed)
                 positions = self._safe_read_positions(self.controller)
                 self.device_queue.put(("positions", positions))
                 LOG.info("Go To Best Z completed")
@@ -416,6 +654,214 @@ class ProbeStationApp(tk.Tk):
                 self.device_queue.put(("error", f"Go To Best Z failed: {exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _start_autofocus(self) -> None:
+        if not self.enable_autofocus:
+            return
+        if self.autofocus.running:
+            self._set_status("Autofocus is already running.")
+            return
+        if not self.camera.is_open:
+            self._set_status("相机未打开，无法自动对焦")
+            return
+        if not self.controller or not self.controller.is_open:
+            self._set_status("电机未连接，无法自动对焦")
+            return
+        try:
+            params = self._read_autofocus_params()
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        params, clamped = clamp_autofocus_params(params)
+        if clamped:
+            message = (
+                "SAFE_MODE enabled: parameters clamped to "
+                f"range={params.scan_range}, step={params.scan_step}, speed={params.autofocus_speed}"
+            )
+            LOG.warning(message)
+            self._set_status(message)
+            self._set_autofocus_param_vars(params)
+
+        confirmed = messagebox.askyesno(
+            "Confirm Autofocus",
+            "即将自动移动 Z 轴进行对焦。\n"
+            "请确认样品/探针/镜头安全。\n"
+            "请确认物理急停可用。\n"
+            "第一次测试建议 scan_range <= 20, scan_step <= 5, speed <= 2。\n"
+            "软件急停不能替代物理急停。\n"
+            "是否继续？",
+        )
+        if not confirmed:
+            self._set_status("Autofocus cancelled.")
+            return
+
+        self.autofocus.reset()
+        self.autofocus.running = True
+        self.af_status_var.set("AF status: running")
+        self._refresh_autofocus_labels()
+        self._draw_autofocus_plot()
+        LOG.info("Start Autofocus")
+        LOG.info("Autofocus parameters: %s", params)
+        threading.Thread(target=self._autofocus_worker, args=(params,), daemon=True).start()
+
+    def _stop_autofocus(self) -> None:
+        if not self.autofocus.running:
+            self._set_status("Autofocus is not running.")
+            return
+        self.autofocus.stop_requested = True
+        LOG.info("Stop Autofocus")
+        self.af_status_var.set("AF status: stop requested")
+        self._set_status("Stopping autofocus...")
+        if self.controller and self.controller.is_open:
+            threading.Thread(target=self._safe_stop_worker, daemon=True).start()
+
+    def _read_autofocus_params(self) -> AutofocusParams:
+        try:
+            params = AutofocusParams(
+                scan_range=max(1, int(float(self.af_scan_range_var.get()))),
+                scan_step=max(1, int(float(self.af_scan_step_var.get()))),
+                autofocus_speed=max(1, min(100, int(float(self.af_speed_var.get())))),
+                settle_seconds=max(0.0, float(self.af_settle_seconds_var.get())),
+                sample_seconds=max(0.1, float(self.af_sample_seconds_var.get())),
+                near_best_ratio=max(0.1, min(1.0, float(self.af_near_best_ratio_var.get()))),
+            )
+        except ValueError as exc:
+            raise ValueError("Autofocus parameters must be numbers.") from exc
+        return params
+
+    def _set_autofocus_param_vars(self, params: AutofocusParams) -> None:
+        self.af_scan_range_var.set(str(params.scan_range))
+        self.af_scan_step_var.set(str(params.scan_step))
+        self.af_speed_var.set(str(params.autofocus_speed))
+        self.af_settle_seconds_var.set(str(params.settle_seconds))
+        self.af_sample_seconds_var.set(str(params.sample_seconds))
+        self.af_near_best_ratio_var.set(str(params.near_best_ratio))
+
+    def _autofocus_worker(self, params: AutofocusParams) -> None:
+        current_offset = 0
+        points: list[AutofocusSamplePoint] = []
+        try:
+            self.device_queue.put(("af_status", "AF status: baseline sampling"))
+            self._sleep_with_autofocus_stop(params.settle_seconds)
+            baseline_score, baseline_iqr, baseline_count = self.sample_focus_at_current_z(params.sample_seconds)
+            baseline = AutofocusSamplePoint(0, baseline_score, baseline_iqr, baseline_count)
+            points.append(baseline)
+            LOG.info("Autofocus baseline: score=%.3f iqr=%.3f frames=%s", baseline_score, baseline_iqr, baseline_count)
+            self.device_queue.put(("af_point", baseline))
+
+            self._raise_if_autofocus_stopped()
+            self._move_z_for_autofocus(-params.scan_range, params.autofocus_speed)
+            current_offset = -params.scan_range
+            offsets = build_scan_offsets(params.scan_range, params.scan_step)
+
+            for offset in offsets:
+                self._raise_if_autofocus_stopped()
+                delta = offset - current_offset
+                if delta:
+                    self._move_z_for_autofocus(delta, params.autofocus_speed)
+                    current_offset = offset
+                self.autofocus.current_offset = current_offset
+                self.device_queue.put(("af_offset", current_offset))
+                self._sleep_with_autofocus_stop(params.settle_seconds)
+                score, iqr, frame_count = self.sample_focus_at_current_z(params.sample_seconds)
+                point = AutofocusSamplePoint(offset, score, iqr, frame_count)
+                LOG.info(
+                    "Autofocus point: offset=%s score=%.3f iqr=%.3f frames=%s",
+                    offset,
+                    score,
+                    iqr,
+                    frame_count,
+                )
+                points.append(point)
+                self.device_queue.put(("af_point", point))
+
+            if not points:
+                raise RuntimeError("no autofocus samples collected")
+            peak_score = max(point.score for point in points)
+            final_point = select_final_autofocus_point(points, params.near_best_ratio)
+            LOG.info("Autofocus peak_score=%.3f", peak_score)
+            LOG.info("Autofocus final_offset=%s", final_point.offset)
+            self.autofocus.final_offset = final_point.offset
+            self.device_queue.put(("af_final", final_point.offset))
+
+            delta_back = final_point.offset - current_offset
+            if delta_back:
+                self._move_z_for_autofocus(delta_back, params.autofocus_speed)
+                current_offset = final_point.offset
+            self._sleep_with_autofocus_stop(params.settle_seconds)
+            confirm_score, confirm_iqr, confirm_count = self.sample_focus_at_current_z(params.sample_seconds)
+            LOG.info(
+                "Autofocus confirm_score=%.3f iqr=%.3f frames=%s",
+                confirm_score,
+                confirm_iqr,
+                confirm_count,
+            )
+            self.device_queue.put(("af_confirm", (confirm_score, confirm_iqr)))
+            if confirm_score >= peak_score * 0.90:
+                self.device_queue.put(("af_done", "Autofocus completed."))
+            else:
+                self.device_queue.put(
+                    (
+                        "af_done",
+                        "自动对焦完成，但确认分数偏低，建议重试或使用手动辅助对焦。",
+                    )
+                )
+            LOG.info("Autofocus completed")
+        except InterruptedError:
+            LOG.info("Autofocus stopped")
+            self.device_queue.put(("af_done", "Autofocus stopped."))
+        except Exception as exc:
+            LOG.exception("autofocus failed")
+            if self.controller and self.controller.is_open:
+                try:
+                    self.controller.stop_all()
+                except Exception:
+                    LOG.exception("stop_all after autofocus failure failed")
+            self.device_queue.put(("af_error", f"Autofocus failed: {exc}"))
+
+    def _move_z_for_autofocus(self, delta: int, speed: int) -> None:
+        if delta == 0:
+            return
+        self._raise_if_autofocus_stopped()
+        direction = 1 if delta > 0 else -1
+        controller_direction = logical_direction_to_controller_direction("Z", direction)
+        self.controller.move_relative("Z", controller_direction, abs(delta), speed)
+
+    def _sleep_with_autofocus_stop(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self._raise_if_autofocus_stopped()
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def _raise_if_autofocus_stopped(self) -> None:
+        if self.autofocus.stop_requested:
+            raise InterruptedError("autofocus stopped")
+
+    def sample_focus_at_current_z(self, sample_seconds: float) -> tuple[float, float, int]:
+        values: list[float] = []
+        failures = 0
+        deadline = time.monotonic() + sample_seconds
+        while time.monotonic() < deadline:
+            self._raise_if_autofocus_stopped()
+            try:
+                with self.camera_lock:
+                    frame = self.camera.read_frame()
+                    if self.focus_rois is None:
+                        self.focus_rois = auto_select_rois(frame)
+                    focus_index = calculate_focus_index(frame, self.focus_rois)
+                values.append(float(focus_index))
+                failures = 0
+            except Exception:
+                failures += 1
+                LOG.exception("autofocus camera sample failed")
+                if failures > 10:
+                    raise RuntimeError("camera sampling failed more than 10 consecutive times")
+                time.sleep(0.05)
+        if len(values) < MIN_SAMPLE_FRAMES:
+            raise RuntimeError(f"not enough valid focus frames: {len(values)}")
+        score = robust_representative(values)
+        iqr = _interquartile_range(values)
+        return score, iqr, len(values)
 
     def _read_speed(self, default: int = 10) -> int:
         try:
@@ -431,6 +877,8 @@ class ProbeStationApp(tk.Tk):
             return {axis: controller.read_position(axis) for axis in ("X", "Y", "Z")}
 
     def _poll_positions(self) -> None:
+        if self._closing:
+            return
         if self.controller and self.controller.is_open and not self._position_poll_running:
             self._position_poll_running = True
 
@@ -444,22 +892,25 @@ class ProbeStationApp(tk.Tk):
                     self.device_queue.put(("position_poll_done", None))
 
             threading.Thread(target=worker, daemon=True).start()
-        self.after(700, self._poll_positions)
+        self._schedule_after(700, self._poll_positions)
 
     def _camera_loop(self) -> None:
+        if self._closing:
+            return
         if self.camera.is_open:
             try:
-                frame = self.camera.read_frame()
-                if self.focus_rois is None:
-                    self.focus_rois = auto_select_rois(frame)
-                focus_index = calculate_focus_index(frame, self.focus_rois)
+                with self.camera_lock:
+                    frame = self.camera.read_frame()
+                    if self.focus_rois is None:
+                        self.focus_rois = auto_select_rois(frame)
+                    focus_index = calculate_focus_index(frame, self.focus_rois)
                 self._update_focus(focus_index)
                 self._show_frame(frame)
             except Exception:
                 LOG.exception("camera loop error")
                 self.camera_status_var.set("Camera: read error, no-camera mode")
                 self.camera.close()
-        self.after(60, self._camera_loop)
+        self._schedule_after(60, self._camera_loop)
 
     def _update_focus(self, focus_index: float) -> None:
         self.focus_var.set(f"Focus index: {focus_index:.2f}")
@@ -550,6 +1001,8 @@ class ProbeStationApp(tk.Tk):
         canvas.create_line(*points, fill="#4cc9f0", width=2)
 
     def _drain_device_queue(self) -> None:
+        if self._closing:
+            return
         try:
             while True:
                 kind, payload = self.device_queue.get_nowait()
@@ -574,9 +1027,47 @@ class ProbeStationApp(tk.Tk):
                     self._set_status(str(payload))
                 elif kind == "error":
                     self._set_status(str(payload))
+                elif kind == "af_status":
+                    self.af_status_var.set(str(payload))
+                elif kind == "af_offset":
+                    self.autofocus.current_offset = int(payload)
+                    self._refresh_autofocus_labels()
+                elif kind == "af_point":
+                    self._add_autofocus_point(payload)
+                elif kind == "af_final":
+                    self.autofocus.final_offset = int(payload)
+                    self._refresh_autofocus_labels()
+                    self._draw_autofocus_plot()
+                elif kind == "af_confirm":
+                    confirm_score, confirm_iqr = payload
+                    self.autofocus.confirm_score = float(confirm_score)
+                    self.autofocus.confirm_iqr = float(confirm_iqr)
+                    self._refresh_autofocus_labels()
+                elif kind == "af_done":
+                    self.autofocus.running = False
+                    self.autofocus.stop_requested = False
+                    self.af_status_var.set(f"AF status: {payload}")
+                    self._set_status(str(payload))
+                elif kind == "af_error":
+                    self.autofocus.running = False
+                    self.autofocus.stop_requested = False
+                    self.af_status_var.set("AF status: failed")
+                    self._set_status(str(payload))
         except queue.Empty:
             pass
-        self.after(50, self._drain_device_queue)
+        self._schedule_after(50, self._drain_device_queue)
+
+    def _add_autofocus_point(self, point: AutofocusSamplePoint) -> None:
+        if self.autofocus.sample_points is None:
+            self.autofocus.sample_points = []
+        self.autofocus.sample_points.append(point)
+        self.autofocus.current_offset = point.offset
+        self.autofocus.current_score = point.score
+        if self.autofocus.best_score is None or point.score > self.autofocus.best_score:
+            self.autofocus.best_score = point.score
+            self.autofocus.best_offset = point.offset
+        self._refresh_autofocus_labels()
+        self._draw_autofocus_plot()
 
     def _update_position_labels(self) -> None:
         rel = {axis: self.absolute_pos[axis] - self.software_origin[axis] for axis in ("X", "Y", "Z")}
@@ -621,11 +1112,74 @@ class ProbeStationApp(tk.Tk):
             time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.best_timestamp))
             self.best_focus_time_var.set(f"Best focus time: {time_text}")
 
+    def _refresh_autofocus_labels(self) -> None:
+        if not self.enable_autofocus:
+            return
+        state = self.autofocus
+        self.af_offset_var.set(f"Current offset: {state.current_offset}")
+        self.af_score_var.set(
+            "Current sample focus index: --"
+            if state.current_score is None
+            else f"Current sample focus index: {state.current_score:.2f}"
+        )
+        self.af_best_var.set(
+            "Best score: --" if state.best_score is None else f"Best score: {state.best_score:.2f}"
+        )
+        self.af_best_offset_var.set(
+            "Best offset: --" if state.best_offset is None else f"Best offset: {state.best_offset}"
+        )
+        self.af_final_offset_var.set(
+            "Final offset: --" if state.final_offset is None else f"Final offset: {state.final_offset}"
+        )
+        self.af_confirm_score_var.set(
+            "Confirm score: --"
+            if state.confirm_score is None
+            else f"Confirm score: {state.confirm_score:.2f}"
+        )
+        count = len(state.sample_points or [])
+        self.af_sample_count_var.set(f"Sample points: {count}")
+
+    def _draw_autofocus_plot(self) -> None:
+        canvas = self.af_canvas
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = max(10, canvas.winfo_width())
+        height = max(10, canvas.winfo_height())
+        canvas.create_rectangle(0, 0, width, height, fill="#101820", outline="")
+        points = self.autofocus.sample_points or []
+        if not points:
+            return
+        offsets = [point.offset for point in points]
+        scores = [point.score for point in points]
+        x_min = min(offsets)
+        x_max = max(offsets)
+        y_min = min(scores)
+        y_max = max(scores)
+        x_span = max(1, x_max - x_min)
+        y_span = max(1.0, y_max - y_min)
+        best_offset = self.autofocus.best_offset
+        final_offset = self.autofocus.final_offset
+        for point in points:
+            x = 8 + ((point.offset - x_min) / x_span) * (width - 16)
+            y = height - 8 - ((point.score - y_min) / y_span) * (height - 16)
+            radius = 3
+            fill = "#4cc9f0"
+            if point.offset == best_offset:
+                radius = 5
+                fill = "#ffd166"
+            if final_offset is not None and point.offset == final_offset:
+                radius = 6
+                fill = "#80ed99"
+            canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=fill, outline="")
+        canvas.create_text(8, 8, anchor="nw", fill="#e6edf3", text="offset vs focus")
+
     def _set_status(self, message: str) -> None:
         LOG.info(message)
         self.status_var.set(message)
 
     def _on_close(self) -> None:
+        self._closing = True
         try:
             if self.controller and self.controller.is_open:
                 self.controller.stop_all()
