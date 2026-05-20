@@ -42,6 +42,11 @@ SAFE_MAX_AUTOFOCUS_RANGE = 100
 SAFE_MAX_AUTOFOCUS_STEP = 20
 SAFE_MAX_AUTOFOCUS_SPEED = 5
 MIN_SAMPLE_FRAMES = 3
+DEFAULT_WINDOW_GEOMETRY = "1120x700"
+MIN_WINDOW_WIDTH = 960
+MIN_WINDOW_HEIGHT = 620
+VIDEO_PREVIEW_MAX_WIDTH = 420
+VIDEO_PREVIEW_MAX_HEIGHT = 240
 
 
 def list_serial_port_names() -> list[str]:
@@ -122,6 +127,38 @@ def clamp_manual_motion_params(pulses: int, speed: int) -> tuple[int, int, bool]
     clamped_pulses = min(pulses, SAFE_MAX_MANUAL_STEP)
     clamped_speed = min(speed, SAFE_MAX_MANUAL_SPEED)
     return clamped_pulses, clamped_speed, (clamped_pulses, clamped_speed) != (pulses, speed)
+
+
+@dataclass(frozen=True)
+class ModePanelSpec:
+    visible_sections: tuple[str, ...]
+    primary_actions: tuple[str, ...]
+    status_fields: tuple[str, ...]
+    message: str
+
+
+def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
+    selected = mode if isinstance(mode, Mode) else Mode(str(mode))
+    if selected == Mode.FOCUS_ASSIST:
+        return ModePanelSpec(
+            visible_sections=("manual", "focus_assist"),
+            primary_actions=("Start Manual Focus Assist", "Stop Manual Focus Assist", "Reset Best Focus", "Go To Best Z"),
+            status_fields=("Current focus index", "Best focus index", "Best Z", "Focus curve"),
+            message="Manual Focus Assist: move Z manually; the GUI records best focus and best Z.",
+        )
+    if selected == Mode.AUTO_FOCUS:
+        return ModePanelSpec(
+            visible_sections=("manual", "autofocus"),
+            primary_actions=("Start Autofocus", "Stop Autofocus"),
+            status_fields=("AF status", "Current offset", "Best score", "Final offset", "Focus curve"),
+            message="Auto Focus: Start Autofocus runs a conservative Z-only scan; manual movement returns when AF is stopped or complete.",
+        )
+    return ModePanelSpec(
+        visible_sections=("manual",),
+        primary_actions=("Manual X/Y/Z move", "Stop Space", "Software Emergency Stop Esc"),
+        status_fields=("Absolute position", "Relative position", "Live focus index"),
+        message="Manual Mode: manual X/Y/Z control only; no recording and no automatic movement.",
+    )
 
 
 @dataclass(frozen=True)
@@ -257,8 +294,8 @@ class ProbeStationApp(tk.Tk):
         super().__init__()
         self.app_stage_title = APP_TITLE
         self.title(APP_TITLE)
-        self.geometry("1280x820")
-        self.minsize(1080, 700)
+        self.geometry(DEFAULT_WINDOW_GEOMETRY)
+        self.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.enable_focus_assist = True
         self.enable_autofocus = True
@@ -327,14 +364,17 @@ class ProbeStationApp(tk.Tk):
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
+        self.columnconfigure(2, weight=0)
         self.rowconfigure(0, weight=1)
 
         left = ttk.Frame(self, padding=10)
         left.grid(row=0, column=0, sticky="ns")
+        middle = ttk.Frame(self, padding=(0, 10, 10, 10))
+        middle.grid(row=0, column=1, sticky="nsew")
         right = ttk.Frame(self, padding=(0, 10, 10, 10))
-        right.grid(row=0, column=1, sticky="nsew")
+        right.grid(row=0, column=2, sticky="ne")
+        middle.columnconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
 
         self.port_var = tk.StringVar(value=default_serial_port())
         self.camera_index_var = tk.StringVar(value="0")
@@ -427,7 +467,8 @@ class ProbeStationApp(tk.Tk):
             ).grid(row=row, column=0, sticky="w")
         ttk.Label(modes, textvariable=self.current_mode_var, foreground="#005a8d").grid(row=3, column=0, sticky="w", pady=(6, 0))
 
-        move = ttk.LabelFrame(left, text="Manual Move", padding=8)
+        self.manual_panel = ttk.LabelFrame(left, text="Manual Move", padding=8)
+        move = self.manual_panel
         move.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         for col in range(3):
             move.columnconfigure(col, weight=1)
@@ -436,20 +477,28 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(move, text="Speed %").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(move, textvariable=self.speed_var, width=8).grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
 
-        ttk.Button(move, text="Y+  W", command=lambda: self._move("Y", +1)).grid(row=2, column=1, sticky="ew", pady=(10, 2))
-        ttk.Button(move, text="X-  A", command=lambda: self._move("X", -1)).grid(row=3, column=0, sticky="ew", padx=2, pady=2)
+        self.manual_move_buttons = [
+            ttk.Button(move, text="Y+  W", command=lambda: self._move("Y", +1)),
+            ttk.Button(move, text="X-  A", command=lambda: self._move("X", -1)),
+            ttk.Button(move, text="X+  D", command=lambda: self._move("X", +1)),
+            ttk.Button(move, text="Y-  S", command=lambda: self._move("Y", -1)),
+            ttk.Button(move, text="Z-  Q", command=lambda: self._move("Z", -1)),
+            ttk.Button(move, text="Z+  E", command=lambda: self._move("Z", +1)),
+        ]
+        self.manual_move_buttons[0].grid(row=2, column=1, sticky="ew", pady=(10, 2))
+        self.manual_move_buttons[1].grid(row=3, column=0, sticky="ew", padx=2, pady=2)
         ttk.Button(move, text="Stop Space", command=self._stop_all).grid(row=3, column=1, sticky="ew", padx=2, pady=2)
-        ttk.Button(move, text="X+  D", command=lambda: self._move("X", +1)).grid(row=3, column=2, sticky="ew", padx=2, pady=2)
-        ttk.Button(move, text="Y-  S", command=lambda: self._move("Y", -1)).grid(row=4, column=1, sticky="ew", pady=2)
-        ttk.Button(move, text="Z-  Q", command=lambda: self._move("Z", -1)).grid(row=5, column=0, sticky="ew", padx=2, pady=(10, 2))
-        ttk.Button(move, text="Z+  E", command=lambda: self._move("Z", +1)).grid(row=5, column=2, sticky="ew", padx=2, pady=(10, 2))
+        self.manual_move_buttons[2].grid(row=3, column=2, sticky="ew", padx=2, pady=2)
+        self.manual_move_buttons[3].grid(row=4, column=1, sticky="ew", pady=2)
+        self.manual_move_buttons[4].grid(row=5, column=0, sticky="ew", padx=2, pady=(10, 2))
+        self.manual_move_buttons[5].grid(row=5, column=2, sticky="ew", padx=2, pady=(10, 2))
         ttk.Button(move, text="Software Emergency Stop  Esc", command=self._emergency_stop).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
         ttk.Button(move, text="Set Current As Software Origin", command=self._set_software_origin).grid(
             row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0)
         )
 
-        pos = ttk.LabelFrame(left, text="Position", padding=8)
-        pos.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        pos = ttk.LabelFrame(middle, text="Position / Status", padding=8)
+        pos.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(pos, textvariable=self.abs_pos_var).grid(row=0, column=0, sticky="w")
         ttk.Label(pos, textvariable=self.rel_pos_var).grid(row=1, column=0, sticky="w")
         ttk.Label(pos, textvariable=self.recent_command_var).grid(row=2, column=0, sticky="w")
@@ -459,8 +508,9 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(pos, textvariable=self.debug_log_var, wraplength=310).grid(row=6, column=0, sticky="w")
 
         if self.enable_focus_assist:
-            focus = ttk.LabelFrame(left, text="手动辅助对焦 Manual Focus Assist", padding=8)
-            focus.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+            self.focus_panel = ttk.LabelFrame(middle, text="手动辅助对焦 Manual Focus Assist", padding=8)
+            focus = self.focus_panel
+            focus.grid(row=1, column=0, sticky="ew", pady=(0, 8))
             focus.columnconfigure(0, weight=1)
             focus.columnconfigure(1, weight=1)
             ttk.Label(focus, textvariable=self.focus_assist_message_var, wraplength=300).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -482,8 +532,9 @@ class ProbeStationApp(tk.Tk):
             self.curve_canvas = None
 
         if self.enable_autofocus:
-            autofocus = ttk.LabelFrame(left, text="Conservative Full Scan Autofocus / 保守 Z 轴自动对焦", padding=8)
-            autofocus.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+            self.autofocus_panel = ttk.LabelFrame(middle, text="Conservative Full Scan Autofocus / 保守 Z 轴自动对焦", padding=8)
+            autofocus = self.autofocus_panel
+            autofocus.grid(row=1, column=0, sticky="ew", pady=(0, 8))
             for col in range(4):
                 autofocus.columnconfigure(col, weight=1)
             ttk.Label(autofocus, text="Range").grid(row=0, column=0, sticky="w")
@@ -517,8 +568,8 @@ class ProbeStationApp(tk.Tk):
         else:
             self.af_canvas = None
 
-        camera_controls = ttk.LabelFrame(left, text="Camera Controls", padding=8)
-        camera_controls.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+        camera_controls = ttk.LabelFrame(right, text="Camera Controls", padding=8)
+        camera_controls.grid(row=1, column=0, sticky="ew", pady=(8, 8))
         for col in range(4):
             camera_controls.columnconfigure(col, weight=1)
         ttk.Button(camera_controls, text="Read Camera Properties", command=self._read_camera_properties).grid(row=0, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
@@ -541,22 +592,25 @@ class ProbeStationApp(tk.Tk):
         ttk.Button(camera_controls, text="Reset Auto Camera Mode", command=self._reset_auto_camera_mode).grid(row=5, column=2, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
         ttk.Label(camera_controls, textvariable=self.camera_properties_var, wraplength=310).grid(row=6, column=0, columnspan=4, sticky="w")
 
-        focus_info = ttk.LabelFrame(left, text="Focus Info", padding=8)
-        focus_info.grid(row=7, column=0, sticky="ew", pady=(0, 8))
+        focus_info = ttk.LabelFrame(middle, text="Focus Info", padding=8)
+        focus_info.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         for row, variable in enumerate(
             [self.focus_var, self.brightness_var, self.saturation_var, self.underexposed_var, self.exposure_warning_var]
         ):
             ttk.Label(focus_info, textvariable=variable).grid(row=row, column=0, sticky="w")
 
-        mode_panel = ttk.LabelFrame(left, text="Mode-specific panel", padding=8)
-        mode_panel.grid(row=8, column=0, sticky="ew", pady=(0, 8))
+        mode_panel = ttk.LabelFrame(middle, text="Mode-specific panel", padding=8)
+        mode_panel.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(mode_panel, textvariable=self.mode_message_var, wraplength=310).grid(row=0, column=0, sticky="w")
 
-        warning = ttk.Label(left, textvariable=self.status_var, wraplength=310, foreground="#8a4b00")
-        warning.grid(row=9, column=0, sticky="ew")
+        warning = ttk.Label(middle, textvariable=self.status_var, wraplength=360, foreground="#8a4b00")
+        warning.grid(row=4, column=0, sticky="ew")
 
-        self.video_label = ttk.Label(right, text="No camera")
+        video_frame = ttk.LabelFrame(right, text="Camera Preview", padding=4)
+        video_frame.grid(row=0, column=0, sticky="ne")
+        self.video_label = ttk.Label(video_frame, text="No camera", anchor="center")
         self.video_label.grid(row=0, column=0, sticky="nsew")
+        self._apply_mode_layout()
 
     def _bind_keys(self) -> None:
         self.bind("<KeyPress-a>", lambda event: self._axis_key(event, "X", -1))
@@ -581,18 +635,32 @@ class ProbeStationApp(tk.Tk):
 
     def _on_mode_change(self) -> None:
         mode = self._current_mode()
+        spec = mode_panel_spec(mode)
         self.current_mode_var.set(f"Current mode: {mode.value}")
-        messages = {
-            Mode.MANUAL: "Manual Mode: manual X/Y/Z control only; no recording and no automatic movement.",
-            Mode.FOCUS_ASSIST: "Manual Focus Assist: manually move Z while the GUI records best focus; Go To Best Z only moves Z after confirmation.",
-            Mode.AUTO_FOCUS: "Auto Focus: conservative full-scan autofocus. It only moves Z. Manual movement is disabled while AF runs.",
-        }
         if mode != Mode.FOCUS_ASSIST:
             self.manual_focus_assist.recording = False
             self._refresh_focus_assist_labels()
-        self.mode_message_var.set(messages[mode])
+        self.mode_message_var.set(
+            f"{spec.message}\nActions: {', '.join(spec.primary_actions)}\nStatus: {', '.join(spec.status_fields)}"
+        )
+        self._apply_mode_layout()
         LOG.info("mode switched: %s", mode.value)
         self._set_status(f"Mode switched to {mode.value}. 软件急停不能替代物理急停。")
+
+    def _apply_mode_layout(self) -> None:
+        spec = mode_panel_spec(self._current_mode())
+        focus_visible = "focus_assist" in spec.visible_sections
+        autofocus_visible = "autofocus" in spec.visible_sections
+        if hasattr(self, "focus_panel"):
+            if focus_visible:
+                self.focus_panel.grid()
+            else:
+                self.focus_panel.grid_remove()
+        if hasattr(self, "autofocus_panel"):
+            if autofocus_visible:
+                self.autofocus_panel.grid()
+            else:
+                self.autofocus_panel.grid_remove()
 
     def _connect_motor(self) -> None:
         port = self.port_var.get().strip()
@@ -661,7 +729,10 @@ class ProbeStationApp(tk.Tk):
         if ok:
             self.focus_rois = None
             self.camera_status_var.set(f"Camera: opened index {index} backend {backend}")
-            self._set_status("Camera opened.")
+            props = self.camera.get_camera_properties()
+            self.exposure_var.set(str(props.get("exposure") or ""))
+            self.gain_var.set(str(props.get("gain") or ""))
+            self._set_status("Camera opened with low-exposure OpenCV startup defaults.")
         else:
             self.camera_status_var.set("Camera: no-camera mode")
             self.video_label.configure(text="No camera", image="")
@@ -771,6 +842,7 @@ class ProbeStationApp(tk.Tk):
         self.recent_command_var.set("Recent command: Stop all axes")
         if self.autofocus.running:
             self.autofocus.stop_requested = True
+            self._set_manual_controls_enabled(True)
             LOG.info("Stop Autofocus requested by Space/controlled stop")
             self.device_queue.put(("af_status", "AF status: stop requested"))
         if not self.controller or not self.controller.is_open:
@@ -791,6 +863,7 @@ class ProbeStationApp(tk.Tk):
         self._set_status("SOFTWARE emergency stop sent. 软件急停不能替代物理急停。")
         if self.autofocus.running:
             self.autofocus.stop_requested = True
+            self._set_manual_controls_enabled(True)
             LOG.warning("Emergency Stop during AF")
             self.device_queue.put(("af_status", "AF status: emergency stop requested"))
         if not self.controller or not self.controller.is_open:
@@ -933,6 +1006,7 @@ class ProbeStationApp(tk.Tk):
 
         self.autofocus.reset()
         self.autofocus.running = True
+        self._set_manual_controls_enabled(False)
         self.running_state_var.set("Running state: autofocus")
         self.recent_command_var.set("Recent command: Start Autofocus")
         self.af_status_var.set("AF status: running")
@@ -952,6 +1026,11 @@ class ProbeStationApp(tk.Tk):
         self._set_status("Stopping autofocus...")
         if self.controller and self.controller.is_open:
             threading.Thread(target=self._safe_stop_worker, daemon=True).start()
+
+    def _set_manual_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for button in getattr(self, "manual_move_buttons", []):
+            button.configure(state=state)
 
     def _read_autofocus_params(self) -> AutofocusParams:
         try:
@@ -984,6 +1063,7 @@ class ProbeStationApp(tk.Tk):
             baseline_score, baseline_iqr, baseline_count = self.sample_focus_at_current_z(params.sample_seconds)
             baseline = AutofocusSamplePoint(0, baseline_score, baseline_iqr, baseline_count)
             points.append(baseline)
+            self.autofocus.current_score = baseline_score
             LOG.info("Autofocus baseline: score=%.3f iqr=%.3f frames=%s", baseline_score, baseline_iqr, baseline_count)
             self.device_queue.put(("af_point", baseline))
 
@@ -1003,6 +1083,7 @@ class ProbeStationApp(tk.Tk):
                 self._sleep_with_autofocus_stop(params.settle_seconds)
                 score, iqr, frame_count = self.sample_focus_at_current_z(params.sample_seconds)
                 point = AutofocusSamplePoint(offset, score, iqr, frame_count)
+                self.autofocus.current_score = score
                 LOG.info(
                     "Autofocus point: offset=%s score=%.3f iqr=%.3f frames=%s",
                     offset,
@@ -1219,8 +1300,8 @@ class ProbeStationApp(tk.Tk):
             return
         self._last_frame_time = now
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        label_w = max(320, self.video_label.winfo_width())
-        label_h = max(240, self.video_label.winfo_height())
+        label_w = VIDEO_PREVIEW_MAX_WIDTH
+        label_h = VIDEO_PREVIEW_MAX_HEIGHT
         height, width = rgb.shape[:2]
         scale = min(label_w / width, label_h / height)
         new_w = max(1, int(width * scale))
@@ -1311,12 +1392,14 @@ class ProbeStationApp(tk.Tk):
                 elif kind == "af_done":
                     self.autofocus.running = False
                     self.autofocus.stop_requested = False
+                    self._set_manual_controls_enabled(True)
                     self.running_state_var.set("Running state: idle")
                     self.af_status_var.set(f"AF status: {payload}")
                     self._set_status(str(payload))
                 elif kind == "af_error":
                     self.autofocus.running = False
                     self.autofocus.stop_requested = False
+                    self._set_manual_controls_enabled(True)
                     self.running_state_var.set("Running state: error")
                     self.recent_error_var.set(f"Recent error: {payload}")
                     self.af_status_var.set("AF status: failed")

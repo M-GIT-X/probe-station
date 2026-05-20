@@ -26,6 +26,19 @@ BACKENDS = {
     "ANY": "CAP_ANY",
 }
 
+
+def startup_camera_settings(backend: str) -> dict[str, float | bool]:
+    """Conservative defaults for OpenCV capture, which often opens too bright."""
+    name = backend.upper()
+    exposure = -6.0
+    if name == "DSHOW":
+        exposure = -7.0
+    return {
+        "auto_exposure": False,
+        "exposure": exposure,
+        "gain": 0.0,
+    }
+
 PROPERTY_NAMES = {
     "brightness": "CAP_PROP_BRIGHTNESS",
     "contrast": "CAP_PROP_CONTRAST",
@@ -106,6 +119,7 @@ class OpenCVCamera:
                 return False
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self._capture = capture
+            self.apply_camera_settings(startup_camera_settings(self.backend_name))
             LOG.info("camera opened: index=%s backend=%s", self.index, self.backend_name)
             return True
         except Exception:
