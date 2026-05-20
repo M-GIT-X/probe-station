@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from typing import Optional
@@ -17,6 +18,25 @@ LOG = logging.getLogger(__name__)
 
 class StageControllerError(Exception):
     """Raised for serial, protocol, or motion-control failures."""
+
+
+def windows_device_path(port: str) -> str:
+    """Return a Windows device path for COM ports, preserving non-COM names."""
+    name = str(port).strip()
+    upper = name.upper()
+    if upper.startswith("\\\\.\\"):
+        return name
+    if upper.startswith("COM") and upper[3:].isdigit():
+        return f"\\\\.\\{name}"
+    return name
+
+
+def is_windows_device_not_functioning_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return "PermissionError(13" in text and (
+        "device attached to the system is not functioning" in text.lower()
+        or "None, 31" in text
+    )
 
 
 class StageController:
@@ -52,25 +72,117 @@ class StageController:
         with self._operation_lock:
             if self.is_open:
                 return
-            try:
-                self._serial = serial.Serial(
-                    port=self.port,
-                    baudrate=self.baudrate,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=self.timeout,
-                    write_timeout=self.write_timeout,
+            errors: list[str] = []
+            for label, port, write_timeout, low_control_lines in self._serial_open_attempts():
+                try:
+                    self._serial = self._open_serial_port(port, write_timeout, low_control_lines)
+                    self._initialize_open_serial()
+                    LOG.info("serial port opened using %s attempt on %s", label, port)
+                    return
+                except Exception as exc:
+                    errors.append(f"{label} ({port}): {exc}")
+                    self.close()
+                    LOG.warning("serial open attempt failed: %s (%s): %s", label, port, exc)
+
+            detail = "; ".join(errors)
+            message = f"failed to open serial port {self.port}: {detail}"
+            if any("PermissionError(13" in error and "31" in error for error in errors):
+                message += (
+                    ". Windows reports the device is present but failed while configuring it. "
+                    "Try reconnecting the USB serial adapter, disabling/re-enabling the COM port in Device Manager, "
+                    "or reinstalling the USB-serial driver if this persists."
                 )
-                self._serial.reset_input_buffer()
-                self._serial.reset_output_buffer()
-                self._write(protocol.disable_realtime_position_upload())
-                time.sleep(0.05)
-                self._serial.reset_input_buffer()
-                self._rx_buffer.clear()
+            raise StageControllerError(message)
+
+    def _serial_open_attempts(self) -> list[tuple[str, str, float | None, bool]]:
+        attempts: list[tuple[str, str, float | None, bool]] = [
+            ("standard", self.port, self.write_timeout, False),
+            ("standard-no-write-timeout", self.port, None, False),
+        ]
+        if sys.platform.startswith("win"):
+            device_path = windows_device_path(self.port)
+            if device_path != self.port:
+                attempts.extend(
+                    [
+                        ("windows-device-path", device_path, self.write_timeout, False),
+                        ("windows-device-path-no-write-timeout", device_path, None, False),
+                    ]
+                )
+            attempts.extend(
+                [
+                    ("low-rts-dtr", self.port, self.write_timeout, True),
+                    ("low-rts-dtr-no-write-timeout", self.port, None, True),
+                ]
+            )
+            if device_path != self.port:
+                attempts.extend(
+                    [
+                        ("windows-device-path-low-rts-dtr", device_path, self.write_timeout, True),
+                        ("windows-device-path-low-rts-dtr-no-write-timeout", device_path, None, True),
+                    ]
+                )
+        return attempts
+
+    def _open_serial_port(
+        self,
+        port: str,
+        write_timeout: float | None,
+        low_control_lines: bool,
+    ) -> serial.Serial:
+        if low_control_lines:
+            ser = serial.Serial()
+            ser.port = port
+            ser.baudrate = self.baudrate
+            ser.bytesize = serial.EIGHTBITS
+            ser.parity = serial.PARITY_NONE
+            ser.stopbits = serial.STOPBITS_ONE
+            ser.timeout = self.timeout
+            ser.write_timeout = write_timeout
+            ser.xonxoff = False
+            ser.rtscts = False
+            ser.dsrdtr = False
+            ser.rts = False
+            ser.dtr = False
+            try:
+                ser.open()
             except Exception as exc:
-                self.close()
-                raise StageControllerError(f"failed to open serial port {self.port}: {exc}") from exc
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                raise exc
+            return ser
+
+        return serial.Serial(
+            port=port,
+            baudrate=self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=self.timeout,
+            write_timeout=write_timeout,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
+
+    def _initialize_open_serial(self) -> None:
+        self._reset_serial_buffers()
+        self._write(protocol.disable_realtime_position_upload())
+        time.sleep(0.05)
+        self._reset_serial_buffers()
+        self._rx_buffer.clear()
+
+    def _reset_serial_buffers(self) -> None:
+        ser = self._require_serial()
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            LOG.exception("reset_input_buffer failed")
+        try:
+            ser.reset_output_buffer()
+        except Exception:
+            LOG.exception("reset_output_buffer failed")
 
     def close(self) -> None:
         if self._serial:

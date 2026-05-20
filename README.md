@@ -21,6 +21,28 @@ The app starts with one visible main window. It does not scan cameras or connect
 to the motor controller at startup. Runtime diagnostics are written to
 `debug.log` beside `main.py`.
 
+## Windows COM Port Troubleshooting
+
+Check which ports Windows currently sees:
+
+```bat
+uv run python -m serial.tools.list_ports -v
+```
+
+If `COM5` is listed but opening it fails with
+`PermissionError(13, 'A device attached to the system is not functioning.', ..., 31)`,
+the GUI now retries with Windows-specific serial open fallbacks:
+
+- the normal `COM5` name;
+- the Windows device path form `\\.\COM5`;
+- versions without `write_timeout`;
+- versions that keep RTS/DTR low before opening the port.
+
+This keeps normal Windows behavior unchanged when the standard open works, but
+helps USB-serial drivers that fail during Windows `SetCommState` configuration.
+If all attempts fail, disable/enable the COM port in Device Manager or reinstall
+the USB-serial driver.
+
 ## Modes
 
 Use the GUI `Mode Selector` to switch between:
