@@ -117,6 +117,9 @@ use the uv workflow above.
 - `X` = backup software emergency stop
 
 `E` is now Z+ only. It is not software emergency stop.
+Axis movement shortcuts are ignored while the cursor is inside serial, camera,
+step, or speed input fields. `Space` stop and `Esc` software emergency stop
+remain available as safety controls.
 
 ## Stage 2 Manual Focus Assist Workflow
 

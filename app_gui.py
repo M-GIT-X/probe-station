@@ -44,6 +44,16 @@ def serial_port_choices() -> list[str]:
     return ports
 
 
+def should_ignore_axis_shortcut(widget) -> bool:
+    if widget is None:
+        return False
+    try:
+        widget_class = widget.winfo_class()
+    except Exception:
+        return False
+    return widget_class in {"Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox"}
+
+
 @dataclass
 class ManualFocusAssistState:
     recording: bool = False
@@ -216,17 +226,22 @@ class ProbeStationApp(tk.Tk):
         self.video_label.grid(row=0, column=0, sticky="nsew")
 
     def _bind_keys(self) -> None:
-        self.bind("<KeyPress-a>", lambda _e: self._move("X", -1))
-        self.bind("<KeyPress-d>", lambda _e: self._move("X", +1))
-        self.bind("<KeyPress-w>", lambda _e: self._move("Y", +1))
-        self.bind("<KeyPress-s>", lambda _e: self._move("Y", -1))
-        self.bind("<KeyPress-q>", lambda _e: self._move("Z", -1))
-        self.bind("<KeyPress-e>", lambda _e: self._move("Z", +1))
-        self.bind("<KeyPress-r>", lambda _e: self._move("Z", +1))
-        self.bind("<KeyPress-f>", lambda _e: self._move("Z", -1))
+        self.bind("<KeyPress-a>", lambda event: self._axis_key(event, "X", -1))
+        self.bind("<KeyPress-d>", lambda event: self._axis_key(event, "X", +1))
+        self.bind("<KeyPress-w>", lambda event: self._axis_key(event, "Y", +1))
+        self.bind("<KeyPress-s>", lambda event: self._axis_key(event, "Y", -1))
+        self.bind("<KeyPress-q>", lambda event: self._axis_key(event, "Z", -1))
+        self.bind("<KeyPress-e>", lambda event: self._axis_key(event, "Z", +1))
+        self.bind("<KeyPress-r>", lambda event: self._axis_key(event, "Z", +1))
+        self.bind("<KeyPress-f>", lambda event: self._axis_key(event, "Z", -1))
         self.bind("<space>", lambda _e: self._stop_all())
         self.bind("<KeyPress-x>", lambda _e: self._emergency_stop())
         self.bind("<Escape>", lambda _e: self._emergency_stop())
+
+    def _axis_key(self, event, axis: str, direction: int) -> None:
+        if should_ignore_axis_shortcut(getattr(event, "widget", None)):
+            return
+        self._move(axis, direction)
 
     def _connect_motor(self) -> None:
         port = self.port_var.get().strip()
