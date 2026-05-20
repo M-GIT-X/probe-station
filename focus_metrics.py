@@ -110,6 +110,36 @@ def calculate_focus_index(frame, rois: list[tuple[int, int, int, int]] | None = 
     return robust_representative(values)
 
 
+def brightness_diagnostics(frame) -> dict[str, float | bool]:
+    if frame is None:
+        return {
+            "frame_saturation": 0.0,
+            "overexposed": False,
+            "mean_brightness": 0.0,
+            "underexposed_fraction": 0.0,
+        }
+    arr = np.asarray(frame)
+    frame_saturation = float(np.mean(arr >= 250))
+    mean_brightness = float(arr.mean())
+    underexposed_fraction = float(np.mean(arr <= 5))
+    return {
+        "frame_saturation": frame_saturation,
+        "overexposed": frame_saturation > 0.10 or mean_brightness > 220.0,
+        "mean_brightness": mean_brightness,
+        "underexposed_fraction": underexposed_fraction,
+    }
+
+
+def calculate_focus_index_with_info(
+    frame,
+    rois: list[tuple[int, int, int, int]] | None = None,
+) -> tuple[float, dict[str, float | bool]]:
+    score = calculate_focus_index(frame, rois)
+    info = brightness_diagnostics(frame)
+    info["focus_index"] = float(score)
+    return score, info
+
+
 def robust_representative(values) -> float:
     cleaned = np.asarray([v for v in values if np.isfinite(v)], dtype=np.float64)
     if cleaned.size == 0:

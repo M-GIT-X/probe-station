@@ -1,6 +1,6 @@
 import unittest
 
-from app_gui import ManualFocusAssistState
+from gui_app import ManualFocusAssistState
 
 
 class ManualFocusAssistStateTest(unittest.TestCase):

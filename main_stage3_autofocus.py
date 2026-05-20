@@ -1,21 +1,15 @@
-"""Stage 3 entry point for conservative Z-only autofocus."""
+"""Legacy entry point.
+
+The stage-specific startup flow is retired. Run main.py for the unified GUI.
+"""
 
 from __future__ import annotations
 
-import logging
-
-from app_gui import ProbeStationApp
-from main import configure_logging
+import main as unified_main
 
 
 def main() -> None:
-    configure_logging()
-    try:
-        app = ProbeStationApp(enable_focus_assist=True, enable_autofocus=True)
-        app.mainloop()
-    except Exception:
-        logging.exception("fatal stage 3 GUI error")
-        raise
+    unified_main.main()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import unittest
 
-from app_gui import should_ignore_axis_shortcut
+from gui_app import should_ignore_axis_shortcut
 
 
 class FakeWidget:

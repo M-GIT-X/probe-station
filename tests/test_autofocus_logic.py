@@ -1,10 +1,13 @@
 import unittest
 
-from app_gui import (
+from gui_app import (
     AutofocusParams,
     AutofocusSamplePoint,
+    SAFE_MAX_MANUAL_SPEED,
+    SAFE_MAX_MANUAL_STEP,
     build_scan_offsets,
     clamp_autofocus_params,
+    clamp_manual_motion_params,
     logical_direction_to_controller_direction,
     select_final_autofocus_point,
 )
@@ -21,6 +24,13 @@ class DirectionMappingTest(unittest.TestCase):
 
 
 class AutofocusLogicTest(unittest.TestCase):
+    def test_safe_mode_clamps_manual_motion_params(self):
+        pulses, speed, changed = clamp_manual_motion_params(500, 20)
+
+        self.assertTrue(changed)
+        self.assertEqual(pulses, SAFE_MAX_MANUAL_STEP)
+        self.assertEqual(speed, SAFE_MAX_MANUAL_SPEED)
+
     def test_safe_mode_clamps_autofocus_params(self):
         params = AutofocusParams(
             scan_range=500,

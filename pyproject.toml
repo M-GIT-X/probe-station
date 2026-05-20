@@ -12,9 +12,6 @@ dependencies = [
 
 [project.scripts]
 probe-station = "main:main"
-probe-station-stage1 = "main_stage1_manual:main"
-probe-station-stage2 = "main_stage2_focus_assist:main"
-probe-station-stage3 = "main_stage3_autofocus:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -25,6 +22,7 @@ py-modules = [
     "app_gui",
     "camera_opencv",
     "focus_metrics",
+    "gui_app",
     "main",
     "main_stage1_manual",
     "main_stage2_focus_assist",

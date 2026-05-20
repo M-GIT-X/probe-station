@@ -1,21 +1,15 @@
-"""Stage 2 entry point for manual focus assist."""
+"""Legacy entry point.
+
+The stage-specific startup flow is retired. Run main.py for the unified GUI.
+"""
 
 from __future__ import annotations
 
-import logging
-
-from app_gui import ProbeStationApp
-from main import configure_logging
+import main as unified_main
 
 
 def main() -> None:
-    configure_logging()
-    try:
-        app = ProbeStationApp(enable_focus_assist=True, enable_autofocus=False)
-        app.mainloop()
-    except Exception:
-        logging.exception("fatal stage 2 GUI error")
-        raise
+    unified_main.main()
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ class StageController:
         write_timeout: float = 0.5,
         motion_timeout: float = 15.0,
         invert_x: bool = True,
+        invert_y: bool = True,
+        invert_z: bool = False,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
@@ -35,6 +37,8 @@ class StageController:
         self.write_timeout = write_timeout
         self.motion_timeout = motion_timeout
         self.invert_x = invert_x
+        self.invert_y = invert_y
+        self.invert_z = invert_z
         self._serial: Optional[serial.Serial] = None
         self._rx_buffer = bytearray()
         self._operation_lock = threading.RLock()
@@ -120,6 +124,10 @@ class StageController:
 
             direction = 1 if logical_direction >= 0 else -1
             if axis_value == protocol.Axis.X and self.invert_x:
+                direction *= -1
+            elif axis_value == protocol.Axis.Y and self.invert_y:
+                direction *= -1
+            elif axis_value == protocol.Axis.Z and self.invert_z:
                 direction *= -1
 
             controller_direction = (

@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 import sys
 
-from app_gui import ProbeStationApp
+from gui_app import ProbeStationApp
 
 
 def configure_logging() -> None:
@@ -23,6 +23,7 @@ def configure_logging() -> None:
 
 def main() -> None:
     configure_logging()
+    logging.info("program startup: unified main.py")
     try:
         app = ProbeStationApp()
         app.mainloop()

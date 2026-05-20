@@ -41,9 +41,6 @@ class Command(IntEnum):
     MOVE_RELATIVE = 0xFA
     STOP = 0xFC
     MOVE_DONE = 0xB5
-    HOME_D0_DO_NOT_USE = 0xD0
-    ENABLE_REALTIME_POSITION_UPLOAD_DO_NOT_USE = 0xD1
-    CLEAR_POSITION_D3_DO_NOT_USE_IN_GUI = 0xD3
     DISABLE_REALTIME_POSITION_UPLOAD = 0xD4
 
 
@@ -68,6 +65,10 @@ class Frame:
 
 def checksum(data: bytes) -> int:
     return sum(data) & 0xFF
+
+
+def hex_bytes(data: bytes) -> str:
+    return data.hex(" ").upper()
 
 
 def normalize_axis(axis: Axis | str) -> Axis:
@@ -126,19 +127,19 @@ def extract_frames(buffer: bytearray) -> list[Frame]:
     return frames
 
 
-def communication_test() -> bytes:
+def make_test_connection_command() -> bytes:
     return make_12byte_frame(Command.TEST_CONNECTION, axis=0x00)
 
 
-def read_position(axis: Axis | str) -> bytes:
+def make_read_position_command(axis: Axis | str) -> bytes:
     return make_12byte_frame(Command.READ_POSITION, int(normalize_axis(axis)))
 
 
-def read_io() -> bytes:
+def make_read_io_command() -> bytes:
     return make_12byte_frame(Command.READ_IO, axis=0x00)
 
 
-def move_relative(axis: Axis | str, direction: Direction | int, pulses: int, speed_percent: int) -> bytes:
+def make_move_relative_command(axis: Axis | str, direction: Direction | int, pulses: int, speed_percent: int) -> bytes:
     axis_value = normalize_axis(axis)
     if axis_value == Axis.ALL:
         raise ProtocolError("relative movement must target X, Y, or Z")
@@ -152,6 +153,45 @@ def move_relative(axis: Axis | str, direction: Direction | int, pulses: int, spe
     return make_12byte_frame(Command.MOVE_RELATIVE, int(axis_value), data)
 
 
+def make_stop_command(axis: Axis | str = Axis.ALL, emergency: bool = False) -> bytes:
+    mode = StopMode.EMERGENCY if emergency else StopMode.DECELERATE
+    return make_12byte_frame(Command.STOP, int(normalize_axis(axis)), bytes([mode]))
+
+
+def make_disable_realtime_position_upload_command() -> bytes:
+    return make_12byte_frame(Command.DISABLE_REALTIME_POSITION_UPLOAD, axis=0x00)
+
+
+def validate_response_frame(frame: bytes) -> Frame:
+    return parse_frame(frame)
+
+
+def parse_position_response(frame: bytes | Frame) -> dict[str, int | bool | str]:
+    parsed = frame if isinstance(frame, Frame) else parse_frame(frame)
+    return parse_position_payload(parsed)
+
+
+def parse_io_response(frame: bytes | Frame) -> dict[str, int | str]:
+    parsed = frame if isinstance(frame, Frame) else parse_frame(frame)
+    return parse_io_payload(parsed)
+
+
+def communication_test() -> bytes:
+    return make_test_connection_command()
+
+
+def read_position(axis: Axis | str) -> bytes:
+    return make_read_position_command(axis)
+
+
+def read_io() -> bytes:
+    return make_read_io_command()
+
+
+def move_relative(axis: Axis | str, direction: Direction | int, pulses: int, speed_percent: int) -> bytes:
+    return make_move_relative_command(axis, direction, pulses, speed_percent)
+
+
 def stop(axis: Axis | str = Axis.ALL) -> bytes:
     return make_12byte_frame(Command.STOP, int(normalize_axis(axis)), bytes([StopMode.DECELERATE]))
 
@@ -161,12 +201,7 @@ def emergency_stop(axis: Axis | str = Axis.ALL) -> bytes:
 
 
 def disable_realtime_position_upload() -> bytes:
-    return make_12byte_frame(Command.DISABLE_REALTIME_POSITION_UPLOAD, axis=0x00)
-
-
-def clear_position_d3(axis: Axis | str = Axis.ALL) -> bytes:
-    """Build D3 software-clear frame. The GUI must not call this."""
-    return make_12byte_frame(Command.CLEAR_POSITION_D3_DO_NOT_USE_IN_GUI, int(normalize_axis(axis)))
+    return make_disable_realtime_position_upload_command()
 
 
 def parse_position_payload(frame: Frame) -> dict[str, int | bool | str]:
