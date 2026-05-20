@@ -54,10 +54,12 @@ Use the GUI `Mode Selector` to switch between:
   after confirmation.
 - `Auto Focus`: conservative full-scan autofocus. It only moves Z. It does not
   move X/Y, perform snake scanning, stitching, or multi-point measurement.
+  `Semi Auto` uses the user range/step. `Full Auto` currently accepts only range
+  and automatically runs coarse-to-fine Z scans around the best point.
 
 ## Shortcuts
 
-- `A` / `D` = X- / X+
+- `A` / `D` = X+ / X-
 - `W` / `S` = Y+ / Y-
 - `Q` / `E` = Z- / Z+
 - `Space` = all-axis decelerated stop
@@ -119,13 +121,13 @@ Inputs above those limits are clamped and logged.
 Direction constants are in `gui_app.py`:
 
 ```python
-INVERT_X_DIRECTION = True
+INVERT_X_DIRECTION = False
 INVERT_Y_DIRECTION = True
 INVERT_Z_DIRECTION = False
 ```
 
-X and Y are software-inverted based on real-machine testing. Z keeps the
-successful Manual Focus Assist direction.
+X was swapped after later real-machine manual-control feedback. Y remains
+software-inverted. Z keeps the successful Manual Focus Assist direction.
 
 ## Module Layout
 
@@ -143,15 +145,21 @@ successful Manual Focus Assist direction.
 
 ## Auto Focus Function
 
-`ProbeStationApp._autofocus_worker()` performs the conservative full scan:
+`ProbeStationApp._autofocus_worker()` performs the autofocus scan:
 
 1. sample baseline at offset 0;
-2. move Z to `-scan_range`;
-3. scan offsets through `+scan_range`;
+2. in `Semi Auto`, scan the user range/step once;
+3. in `Full Auto`, scan coarse, then refine around the best point with smaller
+   range and step;
 4. sample focus index at each point;
 5. choose a near-best stable point;
 6. move Z to the final offset;
 7. confirm focus score.
+
+Before focus scoring, frames are translated against a reference frame using
+phase correlation. This reduces table/camera jitter in the focus metric. It
+cannot perfectly undo rolling-shutter S-shaped wobble, so the code also relies
+on multi-frame robust scoring and IQR stability selection.
 
 `Stop Autofocus` and `Space` set the AF stop flag and call `stage.stop_all()`.
 `Esc` sets the same stop flag and calls `stage.emergency_stop_all()`.

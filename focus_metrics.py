@@ -140,6 +140,41 @@ def calculate_focus_index_with_info(
     return score, info
 
 
+def stabilize_frame_translation(reference_frame, frame, max_shift: float = 24.0):
+    """Translate frame toward reference using phase correlation.
+
+    This corrects the dominant whole-frame table/camera jitter before focus
+    scoring. It cannot fully undo rolling-shutter S-shaped wobble, so callers
+    should still use multi-frame robust statistics.
+    """
+    if reference_frame is None or frame is None:
+        return frame, {"dx": 0.0, "dy": 0.0, "response": 0.0, "applied": False}
+    cv = _require_cv2()
+    ref_gray = cv.cvtColor(reference_frame, cv.COLOR_BGR2GRAY) if reference_frame.ndim == 3 else reference_frame
+    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    if ref_gray.shape != gray.shape:
+        return frame, {"dx": 0.0, "dy": 0.0, "response": 0.0, "applied": False}
+
+    ref_float = np.float32(ref_gray)
+    gray_float = np.float32(gray)
+    try:
+        (dx, dy), response = cv.phaseCorrelate(ref_float, gray_float)
+    except Exception:
+        return frame, {"dx": 0.0, "dy": 0.0, "response": 0.0, "applied": False}
+    if not np.isfinite(dx) or not np.isfinite(dy) or abs(dx) > max_shift or abs(dy) > max_shift:
+        return frame, {"dx": float(dx), "dy": float(dy), "response": float(response), "applied": False}
+
+    transform = np.float32([[1, 0, -dx], [0, 1, -dy]])
+    stabilized = cv.warpAffine(
+        frame,
+        transform,
+        (frame.shape[1], frame.shape[0]),
+        flags=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_REFLECT,
+    )
+    return stabilized, {"dx": float(dx), "dy": float(dy), "response": float(response), "applied": True}
+
+
 def robust_representative(values) -> float:
     cleaned = np.asarray([v for v in values if np.isfinite(v)], dtype=np.float64)
     if cleaned.size == 0:

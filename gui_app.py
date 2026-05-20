@@ -16,7 +16,13 @@ from tkinter import messagebox, ttk
 import numpy as np
 
 from camera_opencv import OpenCVCamera
-from focus_metrics import auto_select_rois, brightness_diagnostics, calculate_focus_index, robust_representative
+from focus_metrics import (
+    auto_select_rois,
+    brightness_diagnostics,
+    calculate_focus_index,
+    robust_representative,
+    stabilize_frame_translation,
+)
 from stage_controller import StageController
 
 
@@ -31,7 +37,12 @@ class Mode(Enum):
     AUTO_FOCUS = "Auto Focus"
 
 
-INVERT_X_DIRECTION = True
+class AutofocusMode(Enum):
+    SEMI = "Semi Auto"
+    FULL = "Full Auto"
+
+
+INVERT_X_DIRECTION = False
 INVERT_Y_DIRECTION = True
 INVERT_Z_DIRECTION = False
 
@@ -107,6 +118,18 @@ def should_ignore_axis_shortcut(widget) -> bool:
     return widget_class in {"Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox"}
 
 
+def manual_shortcut_mapping(key: str) -> tuple[str, int] | None:
+    mapping = {
+        "a": ("X", +1),
+        "d": ("X", -1),
+        "w": ("Y", +1),
+        "s": ("Y", -1),
+        "q": ("Z", -1),
+        "e": ("Z", +1),
+    }
+    return mapping.get(key.lower())
+
+
 def logical_direction_to_controller_direction(axis: str, logical_sign: int) -> int:
     sign = 1 if logical_sign >= 0 else -1
     invert_by_axis = {
@@ -172,6 +195,13 @@ class AutofocusParams:
 
 
 @dataclass(frozen=True)
+class AutofocusPassPlan:
+    name: str
+    scan_range: int
+    scan_step: int
+
+
+@dataclass(frozen=True)
 class AutofocusSamplePoint:
     offset: int
     score: float
@@ -226,6 +256,24 @@ def build_scan_offsets(scan_range: int, scan_step: int) -> list[int]:
     if offsets[-1] != scan_range:
         offsets.append(scan_range)
     return offsets
+
+
+def build_autofocus_pass_plan(params: AutofocusParams, mode: AutofocusMode | str) -> list[AutofocusPassPlan]:
+    selected = mode if isinstance(mode, AutofocusMode) else AutofocusMode(str(mode))
+    scan_range = max(1, int(params.scan_range))
+    if selected == AutofocusMode.SEMI:
+        return [AutofocusPassPlan("semi", scan_range, max(1, int(params.scan_step)))]
+
+    coarse_step = max(5, scan_range // 4)
+    mid_range = max(2, scan_range // 2)
+    mid_step = max(2, coarse_step // 2)
+    fine_range = max(1, scan_range // 5)
+    fine_step = max(1, mid_step // 2)
+    return [
+        AutofocusPassPlan("coarse", scan_range, coarse_step),
+        AutofocusPassPlan("refine", mid_range, mid_step),
+        AutofocusPassPlan("fine", fine_range, fine_step),
+    ]
 
 
 def select_final_autofocus_point(
@@ -310,6 +358,7 @@ class ProbeStationApp(tk.Tk):
         self.focus_history: list[float] = []
         self.focus_z_history: list[int] = []
         self.focus_rois = None
+        self.focus_reference_frame = None
         self.last_focus_info = {
             "mean_brightness": 0.0,
             "frame_saturation": 0.0,
@@ -411,6 +460,7 @@ class ProbeStationApp(tk.Tk):
         self.af_scan_range_var = tk.StringVar(value="20")
         self.af_scan_step_var = tk.StringVar(value="5")
         self.af_speed_var = tk.StringVar(value="2")
+        self.af_mode_var = tk.StringVar(value=AutofocusMode.SEMI.value)
         self.af_settle_seconds_var = tk.StringVar(value="0.5")
         self.af_sample_seconds_var = tk.StringVar(value="1.5")
         self.af_near_best_ratio_var = tk.StringVar(value="0.96")
@@ -479,8 +529,8 @@ class ProbeStationApp(tk.Tk):
 
         self.manual_move_buttons = [
             ttk.Button(move, text="Y+  W", command=lambda: self._move("Y", +1)),
-            ttk.Button(move, text="X-  A", command=lambda: self._move("X", -1)),
-            ttk.Button(move, text="X+  D", command=lambda: self._move("X", +1)),
+            ttk.Button(move, text="X+  A", command=lambda: self._move("X", +1)),
+            ttk.Button(move, text="X-  D", command=lambda: self._move("X", -1)),
             ttk.Button(move, text="Y-  S", command=lambda: self._move("Y", -1)),
             ttk.Button(move, text="Z-  Q", command=lambda: self._move("Z", -1)),
             ttk.Button(move, text="Z+  E", command=lambda: self._move("Z", +1)),
@@ -537,20 +587,40 @@ class ProbeStationApp(tk.Tk):
             autofocus.grid(row=1, column=0, sticky="ew", pady=(0, 8))
             for col in range(4):
                 autofocus.columnconfigure(col, weight=1)
-            ttk.Label(autofocus, text="Range").grid(row=0, column=0, sticky="w")
-            ttk.Entry(autofocus, textvariable=self.af_scan_range_var, width=7).grid(row=0, column=1, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Step").grid(row=0, column=2, sticky="w")
-            ttk.Entry(autofocus, textvariable=self.af_scan_step_var, width=7).grid(row=0, column=3, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Speed %").grid(row=1, column=0, sticky="w")
-            ttk.Entry(autofocus, textvariable=self.af_speed_var, width=7).grid(row=1, column=1, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Settle s").grid(row=1, column=2, sticky="w")
-            ttk.Entry(autofocus, textvariable=self.af_settle_seconds_var, width=7).grid(row=1, column=3, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Sample s").grid(row=2, column=0, sticky="w")
-            ttk.Entry(autofocus, textvariable=self.af_sample_seconds_var, width=7).grid(row=2, column=1, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Near best").grid(row=2, column=2, sticky="w")
-            ttk.Entry(autofocus, textvariable=self.af_near_best_ratio_var, width=7).grid(row=2, column=3, sticky="ew", padx=2)
-            ttk.Button(autofocus, text="Start Autofocus", command=self._start_autofocus).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 2), padx=(0, 2))
-            ttk.Button(autofocus, text="Stop Autofocus", command=self._stop_autofocus).grid(row=3, column=2, columnspan=2, sticky="ew", pady=(8, 2), padx=(2, 0))
+            ttk.Radiobutton(
+                autofocus,
+                text="Semi Auto",
+                value=AutofocusMode.SEMI.value,
+                variable=self.af_mode_var,
+                command=self._on_autofocus_mode_change,
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
+            ttk.Radiobutton(
+                autofocus,
+                text="Full Auto",
+                value=AutofocusMode.FULL.value,
+                variable=self.af_mode_var,
+                command=self._on_autofocus_mode_change,
+            ).grid(row=0, column=2, columnspan=2, sticky="w")
+            ttk.Label(autofocus, text="Range").grid(row=1, column=0, sticky="w")
+            self.af_range_entry = ttk.Entry(autofocus, textvariable=self.af_scan_range_var, width=7)
+            self.af_range_entry.grid(row=1, column=1, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Step").grid(row=1, column=2, sticky="w")
+            self.af_step_entry = ttk.Entry(autofocus, textvariable=self.af_scan_step_var, width=7)
+            self.af_step_entry.grid(row=1, column=3, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Speed %").grid(row=2, column=0, sticky="w")
+            self.af_speed_entry = ttk.Entry(autofocus, textvariable=self.af_speed_var, width=7)
+            self.af_speed_entry.grid(row=2, column=1, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Settle s").grid(row=2, column=2, sticky="w")
+            self.af_settle_entry = ttk.Entry(autofocus, textvariable=self.af_settle_seconds_var, width=7)
+            self.af_settle_entry.grid(row=2, column=3, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Sample s").grid(row=3, column=0, sticky="w")
+            self.af_sample_entry = ttk.Entry(autofocus, textvariable=self.af_sample_seconds_var, width=7)
+            self.af_sample_entry.grid(row=3, column=1, sticky="ew", padx=2)
+            ttk.Label(autofocus, text="Near best").grid(row=3, column=2, sticky="w")
+            self.af_near_best_entry = ttk.Entry(autofocus, textvariable=self.af_near_best_ratio_var, width=7)
+            self.af_near_best_entry.grid(row=3, column=3, sticky="ew", padx=2)
+            ttk.Button(autofocus, text="Start Autofocus", command=self._start_autofocus).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 2), padx=(0, 2))
+            ttk.Button(autofocus, text="Stop Autofocus", command=self._stop_autofocus).grid(row=4, column=2, columnspan=2, sticky="ew", pady=(8, 2), padx=(2, 0))
             labels = [
                 self.af_status_var,
                 self.af_offset_var,
@@ -561,10 +631,11 @@ class ProbeStationApp(tk.Tk):
                 self.af_confirm_score_var,
                 self.af_sample_count_var,
             ]
-            for index, variable in enumerate(labels, start=4):
+            for index, variable in enumerate(labels, start=5):
                 ttk.Label(autofocus, textvariable=variable).grid(row=index, column=0, columnspan=4, sticky="w")
             self.af_canvas = tk.Canvas(autofocus, width=280, height=120, bg="#101820", highlightthickness=0)
-            self.af_canvas.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+            self.af_canvas.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+            self._on_autofocus_mode_change()
         else:
             self.af_canvas = None
 
@@ -613,18 +684,18 @@ class ProbeStationApp(tk.Tk):
         self._apply_mode_layout()
 
     def _bind_keys(self) -> None:
-        self.bind("<KeyPress-a>", lambda event: self._axis_key(event, "X", -1))
-        self.bind("<KeyPress-d>", lambda event: self._axis_key(event, "X", +1))
-        self.bind("<KeyPress-w>", lambda event: self._axis_key(event, "Y", +1))
-        self.bind("<KeyPress-s>", lambda event: self._axis_key(event, "Y", -1))
-        self.bind("<KeyPress-q>", lambda event: self._axis_key(event, "Z", -1))
-        self.bind("<KeyPress-e>", lambda event: self._axis_key(event, "Z", +1))
+        for key in ("a", "d", "w", "s", "q", "e"):
+            self.bind(f"<KeyPress-{key}>", lambda event, pressed=key: self._manual_key(event, pressed))
         self.bind("<space>", lambda _e: self._stop_all())
         self.bind("<Escape>", lambda _e: self._emergency_stop())
 
-    def _axis_key(self, event, axis: str, direction: int) -> None:
+    def _manual_key(self, event, key: str) -> None:
         if should_ignore_axis_shortcut(getattr(event, "widget", None)):
             return
+        mapped = manual_shortcut_mapping(key)
+        if mapped is None:
+            return
+        axis, direction = mapped
         self._move(axis, direction)
 
     def _current_mode(self) -> Mode:
@@ -728,6 +799,7 @@ class ProbeStationApp(tk.Tk):
         ok = self.camera.open(index, backend)
         if ok:
             self.focus_rois = None
+            self.focus_reference_frame = None
             self.camera_status_var.set(f"Camera: opened index {index} backend {backend}")
             props = self.camera.get_camera_properties()
             self.exposure_var.set(str(props.get("exposure") or ""))
@@ -741,6 +813,7 @@ class ProbeStationApp(tk.Tk):
     def _close_camera(self) -> None:
         self.camera.close()
         self.focus_rois = None
+        self.focus_reference_frame = None
         self.camera_status_var.set("Camera: closed")
         self.video_label.configure(text="No camera", image="")
         self._set_status("Camera closed.")
@@ -1014,7 +1087,7 @@ class ProbeStationApp(tk.Tk):
         self._draw_autofocus_plot()
         LOG.info("Start Autofocus")
         LOG.info("Autofocus parameters: %s", params)
-        threading.Thread(target=self._autofocus_worker, args=(params,), daemon=True).start()
+        threading.Thread(target=self._autofocus_worker, args=(params, self._current_autofocus_mode()), daemon=True).start()
 
     def _stop_autofocus(self) -> None:
         if not self.autofocus.running:
@@ -1027,6 +1100,30 @@ class ProbeStationApp(tk.Tk):
         if self.controller and self.controller.is_open:
             threading.Thread(target=self._safe_stop_worker, daemon=True).start()
 
+    def _current_autofocus_mode(self) -> AutofocusMode:
+        try:
+            return AutofocusMode(self.af_mode_var.get())
+        except ValueError:
+            return AutofocusMode.SEMI
+
+    def _on_autofocus_mode_change(self) -> None:
+        full_auto = self._current_autofocus_mode() == AutofocusMode.FULL
+        state = "disabled" if full_auto else "normal"
+        for entry_name in (
+            "af_step_entry",
+            "af_speed_entry",
+            "af_settle_entry",
+            "af_sample_entry",
+            "af_near_best_entry",
+        ):
+            entry = getattr(self, entry_name, None)
+            if entry is not None:
+                entry.configure(state=state)
+        if full_auto:
+            self.af_status_var.set("AF status: Full Auto uses range only; step/other parameters are chosen automatically.")
+        else:
+            self.af_status_var.set("AF status: Semi Auto uses user range and step.")
+
     def _set_manual_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         for button in getattr(self, "manual_move_buttons", []):
@@ -1034,6 +1131,15 @@ class ProbeStationApp(tk.Tk):
 
     def _read_autofocus_params(self) -> AutofocusParams:
         try:
+            if self._current_autofocus_mode() == AutofocusMode.FULL:
+                return AutofocusParams(
+                    scan_range=max(1, int(float(self.af_scan_range_var.get()))),
+                    scan_step=5,
+                    autofocus_speed=2,
+                    settle_seconds=0.5,
+                    sample_seconds=1.5,
+                    near_best_ratio=0.96,
+                )
             params = AutofocusParams(
                 scan_range=max(1, int(float(self.af_scan_range_var.get()))),
                 scan_step=max(1, int(float(self.af_scan_step_var.get()))),
@@ -1054,7 +1160,7 @@ class ProbeStationApp(tk.Tk):
         self.af_sample_seconds_var.set(str(params.sample_seconds))
         self.af_near_best_ratio_var.set(str(params.near_best_ratio))
 
-    def _autofocus_worker(self, params: AutofocusParams) -> None:
+    def _autofocus_worker(self, params: AutofocusParams, autofocus_mode: AutofocusMode = AutofocusMode.SEMI) -> None:
         current_offset = 0
         points: list[AutofocusSamplePoint] = []
         try:
@@ -1067,32 +1173,40 @@ class ProbeStationApp(tk.Tk):
             LOG.info("Autofocus baseline: score=%.3f iqr=%.3f frames=%s", baseline_score, baseline_iqr, baseline_count)
             self.device_queue.put(("af_point", baseline))
 
-            self._raise_if_autofocus_stopped()
-            self._move_z_for_autofocus(-params.scan_range, params.autofocus_speed)
-            current_offset = -params.scan_range
-            offsets = build_scan_offsets(params.scan_range, params.scan_step)
-
-            for offset in offsets:
+            center_offset = 0
+            for pass_plan in build_autofocus_pass_plan(params, autofocus_mode):
                 self._raise_if_autofocus_stopped()
-                delta = offset - current_offset
-                if delta:
-                    self._move_z_for_autofocus(delta, params.autofocus_speed)
-                    current_offset = offset
-                self.autofocus.current_offset = current_offset
-                self.device_queue.put(("af_offset", current_offset))
-                self._sleep_with_autofocus_stop(params.settle_seconds)
-                score, iqr, frame_count = self.sample_focus_at_current_z(params.sample_seconds)
-                point = AutofocusSamplePoint(offset, score, iqr, frame_count)
-                self.autofocus.current_score = score
-                LOG.info(
-                    "Autofocus point: offset=%s score=%.3f iqr=%.3f frames=%s",
-                    offset,
-                    score,
-                    iqr,
-                    frame_count,
-                )
-                points.append(point)
-                self.device_queue.put(("af_point", point))
+                self.device_queue.put(("af_status", f"AF status: {pass_plan.name} scan"))
+                pass_points: list[AutofocusSamplePoint] = []
+                raw_offsets = build_scan_offsets(pass_plan.scan_range, pass_plan.scan_step)
+                offsets = [center_offset + offset for offset in raw_offsets]
+
+                for offset in offsets:
+                    self._raise_if_autofocus_stopped()
+                    delta = offset - current_offset
+                    if delta:
+                        self._move_z_for_autofocus(delta, params.autofocus_speed)
+                        current_offset = offset
+                    self.autofocus.current_offset = current_offset
+                    self.device_queue.put(("af_offset", current_offset))
+                    self._sleep_with_autofocus_stop(params.settle_seconds)
+                    score, iqr, frame_count = self.sample_focus_at_current_z(params.sample_seconds)
+                    point = AutofocusSamplePoint(offset, score, iqr, frame_count)
+                    self.autofocus.current_score = score
+                    LOG.info(
+                        "Autofocus %s point: offset=%s score=%.3f iqr=%.3f frames=%s",
+                        pass_plan.name,
+                        offset,
+                        score,
+                        iqr,
+                        frame_count,
+                    )
+                    points.append(point)
+                    pass_points.append(point)
+                    self.device_queue.put(("af_point", point))
+
+                center_offset = select_final_autofocus_point(pass_points, params.near_best_ratio).offset
+                LOG.info("Autofocus %s best center=%s", pass_plan.name, center_offset)
 
             if not points:
                 raise RuntimeError("no autofocus samples collected")
@@ -1159,15 +1273,20 @@ class ProbeStationApp(tk.Tk):
     def sample_focus_at_current_z(self, sample_seconds: float) -> tuple[float, float, int]:
         values: list[float] = []
         failures = 0
+        reference_frame = None
         deadline = time.monotonic() + sample_seconds
         while time.monotonic() < deadline:
             self._raise_if_autofocus_stopped()
             try:
                 with self.camera_lock:
                     frame = self.camera.read_frame()
+                    if reference_frame is None:
+                        reference_frame = frame.copy()
+                    stabilized_frame, motion_info = stabilize_frame_translation(reference_frame, frame)
                     if self.focus_rois is None:
-                        self.focus_rois = auto_select_rois(frame)
-                    focus_index = calculate_focus_index(frame, self.focus_rois)
+                        self.focus_rois = auto_select_rois(stabilized_frame)
+                    focus_index = calculate_focus_index(stabilized_frame, self.focus_rois)
+                    LOG.debug("autofocus stabilization: %s", motion_info)
                 values.append(float(focus_index))
                 failures = 0
             except Exception:
@@ -1221,13 +1340,17 @@ class ProbeStationApp(tk.Tk):
             try:
                 with self.camera_lock:
                     frame = self.camera.read_frame()
+                    if self.focus_reference_frame is None:
+                        self.focus_reference_frame = frame.copy()
+                    stabilized_frame, motion_info = stabilize_frame_translation(self.focus_reference_frame, frame)
                     if self.focus_rois is None:
-                        self.focus_rois = auto_select_rois(frame)
-                    focus_index = calculate_focus_index(frame, self.focus_rois)
-                    self.last_focus_info = brightness_diagnostics(frame)
+                        self.focus_rois = auto_select_rois(stabilized_frame)
+                    focus_index = calculate_focus_index(stabilized_frame, self.focus_rois)
+                    self.last_focus_info = brightness_diagnostics(stabilized_frame)
+                    LOG.debug("live stabilization: %s", motion_info)
                 self._update_focus(focus_index)
                 self._update_focus_diagnostics(self.last_focus_info)
-                self._show_frame(frame)
+                self._show_frame(stabilized_frame)
             except Exception:
                 LOG.exception("camera loop error")
                 self.camera_status_var.set("Camera: read error, no-camera mode")

@@ -1,26 +1,34 @@
 import unittest
 
 from gui_app import (
+    AutofocusMode,
     AutofocusParams,
+    AutofocusPassPlan,
     AutofocusSamplePoint,
     SAFE_MAX_MANUAL_SPEED,
     SAFE_MAX_MANUAL_STEP,
+    build_autofocus_pass_plan,
     build_scan_offsets,
     clamp_autofocus_params,
     clamp_manual_motion_params,
     logical_direction_to_controller_direction,
+    manual_shortcut_mapping,
     select_final_autofocus_point,
 )
 
 
 class DirectionMappingTest(unittest.TestCase):
-    def test_xy_are_inverted_and_z_is_not(self):
-        self.assertEqual(logical_direction_to_controller_direction("X", +1), -1)
-        self.assertEqual(logical_direction_to_controller_direction("X", -1), +1)
+    def test_x_direction_is_swapped_after_real_machine_feedback(self):
+        self.assertEqual(logical_direction_to_controller_direction("X", +1), +1)
+        self.assertEqual(logical_direction_to_controller_direction("X", -1), -1)
         self.assertEqual(logical_direction_to_controller_direction("Y", +1), -1)
         self.assertEqual(logical_direction_to_controller_direction("Y", -1), +1)
         self.assertEqual(logical_direction_to_controller_direction("Z", +1), +1)
         self.assertEqual(logical_direction_to_controller_direction("Z", -1), -1)
+
+    def test_ad_shortcuts_are_swapped_for_manual_x_control(self):
+        self.assertEqual(manual_shortcut_mapping("a"), ("X", +1))
+        self.assertEqual(manual_shortcut_mapping("d"), ("X", -1))
 
 
 class AutofocusLogicTest(unittest.TestCase):
@@ -50,6 +58,24 @@ class AutofocusLogicTest(unittest.TestCase):
 
     def test_scan_offsets_include_positive_range_even_when_step_does_not_land_on_it(self):
         self.assertEqual(build_scan_offsets(20, 6), [-20, -14, -8, -2, 4, 10, 16, 20])
+
+    def test_semi_auto_uses_user_range_and_step_as_single_pass(self):
+        params = AutofocusParams(scan_range=40, scan_step=8)
+
+        self.assertEqual(
+            build_autofocus_pass_plan(params, AutofocusMode.SEMI),
+            [AutofocusPassPlan(name="semi", scan_range=40, scan_step=8)],
+        )
+
+    def test_full_auto_builds_coarse_to_fine_passes_from_range_only(self):
+        params = AutofocusParams(scan_range=40, scan_step=99)
+
+        passes = build_autofocus_pass_plan(params, AutofocusMode.FULL)
+
+        self.assertGreater(len(passes), 1)
+        self.assertEqual(passes[0].scan_range, 40)
+        self.assertLess(passes[-1].scan_range, passes[0].scan_range)
+        self.assertLess(passes[-1].scan_step, passes[0].scan_step)
 
     def test_final_point_prefers_stability_inside_near_best_band(self):
         points = [
