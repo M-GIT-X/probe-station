@@ -79,6 +79,11 @@ If you are using `uv`, run:
 uv run probe-station-stage2
 ```
 
+Stage 2 opens the window titled `Stage 2 Manual Focus Assist`. It shows the
+`Manual Focus Assist` panel only; autofocus controls such as `Start Autofocus`,
+`scan_range`, `scan_step`, `settle_seconds`, `sample_seconds`, and
+`near_best_ratio` are hidden because `enable_autofocus=False`.
+
 ### 5. Run Stage 3 Conservative Full Scan Autofocus
 
 Stage 3 uses the same GUI and adds conservative Z-only autofocus:
@@ -98,6 +103,11 @@ Equivalent direct `uv` command:
 ```bat
 uv run python main_stage3_autofocus.py
 ```
+
+Stage 3 opens the window titled `Stage 3 Conservative Full Scan Autofocus`. It
+keeps Manual Focus Assist available and additionally shows the
+`Conservative Full Scan Autofocus / 保守 Z 轴自动对焦` panel because
+`enable_autofocus=True`.
 
 ## Updating Dependencies
 
@@ -186,6 +196,10 @@ the same direction that passed Stage 2 testing.
 
 Stage 2 does not perform automatic focus scanning. It only records focus quality while the operator moves Z manually.
 
+Stage 2 summary: the operator manually moves Z with `Q` / `E`; the program only
+records the current and best focus index, and can return to the recorded `Best Z`
+after confirmation.
+
 ## Stage 3 Conservative Full Scan Autofocus Workflow
 
 Run stages in this order on real hardware:
@@ -206,6 +220,10 @@ First real-machine Stage 3 parameters should stay conservative:
 Stage 3 only moves Z. It does not perform XY scanning, snake scanning, stitching,
 multi-point measurement, or exposure control. Start near focus manually before
 pressing `Start Autofocus`; do not start from a completely defocused position.
+
+Stage 3 summary: after confirmation, the program automatically moves Z through a
+small conservative range, samples focus index at each offset, selects a near-best
+stable focus point, and moves back to the chosen final Z.
 
 `SAFE_MODE` is enabled by default in `app_gui.py`. It clamps autofocus parameters
 to `SAFE_MAX_AUTOFOCUS_RANGE = 100`, `SAFE_MAX_AUTOFOCUS_STEP = 20`, and

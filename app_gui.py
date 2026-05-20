@@ -75,6 +75,14 @@ def selected_serial_port_is_listed(port: str) -> bool:
     return port.upper() in detected
 
 
+def app_stage_title(enable_focus_assist: bool, enable_autofocus: bool) -> str:
+    if enable_autofocus:
+        return "Stage 3 Conservative Full Scan Autofocus"
+    if enable_focus_assist:
+        return "Stage 2 Manual Focus Assist"
+    return "Stage 1 Manual Control"
+
+
 def should_ignore_axis_shortcut(widget) -> bool:
     if widget is None:
         return False
@@ -228,7 +236,8 @@ class ManualFocusAssistState:
 class ProbeStationApp(tk.Tk):
     def __init__(self, enable_focus_assist: bool = True, enable_autofocus: bool = False) -> None:
         super().__init__()
-        self.title("Three-Axis Probe Station")
+        self.app_stage_title = app_stage_title(enable_focus_assist, enable_autofocus)
+        self.title(f"Three-Axis Probe Station - {self.app_stage_title}")
         self.geometry("1180x760")
         self.minsize(980, 640)
 
@@ -306,7 +315,7 @@ class ProbeStationApp(tk.Tk):
         self.camera_index_var = tk.StringVar(value="0")
         self.step_var = tk.StringVar(value="100")
         self.speed_var = tk.StringVar(value="10")
-        self.status_var = tk.StringVar(value="Ready. 软件急停不能替代物理急停。")
+        self.status_var = tk.StringVar(value=f"{self.app_stage_title}. Ready. 软件急停不能替代物理急停。")
         self.motor_status_var = tk.StringVar(value="Motor: disconnected")
         self.camera_status_var = tk.StringVar(value="Camera: not opened")
         self.focus_var = tk.StringVar(value="Focus index: 0.00")
@@ -404,7 +413,7 @@ class ProbeStationApp(tk.Tk):
             self.curve_canvas = None
 
         if self.enable_autofocus:
-            autofocus = ttk.LabelFrame(left, text="Conservative Full Scan Autofocus", padding=8)
+            autofocus = ttk.LabelFrame(left, text="Conservative Full Scan Autofocus / 保守 Z 轴自动对焦", padding=8)
             autofocus.grid(row=4, column=0, sticky="ew", pady=(0, 8))
             for col in range(4):
                 autofocus.columnconfigure(col, weight=1)
