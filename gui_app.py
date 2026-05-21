@@ -23,7 +23,11 @@ from focus_metrics import (
     robust_representative,
     stabilize_frame_translation,
 )
+from image_stitcher import stitch_session_by_metadata
+from sample_plane import SamplePlanePoint, bounds_from_plane_points, fit_sample_plane
+from scan_plan import TilePoint, generate_stitching_grid
 from stage_controller import StageController
+from stitching_store import StitchingSessionStore, TileRecord
 
 
 LOG = logging.getLogger(__name__)
@@ -35,6 +39,7 @@ class Mode(Enum):
     MANUAL = "Manual Mode"
     FOCUS_ASSIST = "Manual Focus Assist"
     AUTO_FOCUS = "Auto Focus"
+    IMAGE_STITCHING = "Image Stitching"
 
 
 class AutofocusMode(Enum):
@@ -201,6 +206,13 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
             status_fields=("AF status", "Current offset", "Best score", "Final offset", "Focus curve"),
             message="Auto Focus: Start Autofocus runs a conservative Z-only scan; manual movement returns when AF is stopped or complete.",
         )
+    if selected == Mode.IMAGE_STITCHING:
+        return ModePanelSpec(
+            visible_sections=("manual", "image_stitching"),
+            primary_actions=("Record Corner", "Delete Last Corner", "Start Stitching Scan", "Run Offline Stitch"),
+            status_fields=("Corner count", "Sample plane residual", "Tile progress", "Stitched mosaic"),
+            message="Image Stitching: manually focus and record four corners, then scan tiles with Z plane compensation.",
+        )
     return ModePanelSpec(
         visible_sections=("manual",),
         primary_actions=("Manual X/Y/Z move", "Stop Space", "Software Emergency Stop Esc"),
@@ -258,6 +270,19 @@ class AutofocusRunState:
         self.confirm_score = None
         self.confirm_iqr = None
         self.sample_points = []
+
+
+@dataclass
+class StitchingRunState:
+    running: bool = False
+    stop_requested: bool = False
+    corners: list[SamplePlanePoint] | None = None
+    last_session_path: Path | None = None
+    last_mosaic_path: Path | None = None
+
+    def reset_run(self) -> None:
+        self.running = False
+        self.stop_requested = False
 
 
 def clamp_autofocus_params(params: AutofocusParams) -> tuple[AutofocusParams, bool]:
@@ -393,6 +418,7 @@ class ProbeStationApp(tk.Tk):
         self.manual_focus_assist = ManualFocusAssistState()
         self.autofocus = AutofocusRunState()
         self.autofocus.reset()
+        self.stitching = StitchingRunState(corners=[])
         self._photo = None
         self._last_frame_time = 0.0
         self._position_poll_running = False
@@ -499,6 +525,17 @@ class ProbeStationApp(tk.Tk):
         self.af_final_offset_var = tk.StringVar(value="Final offset: --")
         self.af_confirm_score_var = tk.StringVar(value="Confirm score: --")
         self.af_sample_count_var = tk.StringVar(value="Sample points: 0")
+        self.stitch_rows_var = tk.StringVar(value="3")
+        self.stitch_cols_var = tk.StringVar(value="3")
+        self.stitch_speed_var = tk.StringVar(value="2")
+        self.stitch_settle_seconds_var = tk.StringVar(value="0.5")
+        self.stitch_sample_frames_var = tk.StringVar(value="5")
+        self.stitch_pixels_per_pulse_var = tk.StringVar(value="1.0")
+        self.stitch_output_root_var = tk.StringVar(value=str(Path(__file__).with_name("stitching_output")))
+        self.stitch_corner_var = tk.StringVar(value="Corners: 0/4")
+        self.stitch_plane_var = tk.StringVar(value="Plane: not fitted")
+        self.stitch_progress_var = tk.StringVar(value="Progress: idle")
+        self.stitch_output_var = tk.StringVar(value="Output: --")
         self.abs_pos_var = tk.StringVar(value="Abs X=0  Y=0  Z=0")
         self.rel_pos_var = tk.StringVar(value="Rel X=0  Y=0  Z=0")
         self.recent_command_var = tk.StringVar(value="Recent command: --")
@@ -675,6 +712,36 @@ class ProbeStationApp(tk.Tk):
         else:
             self.af_canvas = None
 
+        self.stitching_panel = ttk.LabelFrame(middle, text="Image Stitching / 四角拼场", padding=8)
+        stitching = self.stitching_panel
+        stitching.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for col in range(4):
+            stitching.columnconfigure(col, weight=1)
+        ttk.Label(stitching, textvariable=self.stitch_corner_var).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_plane_var).grid(row=0, column=2, columnspan=2, sticky="w")
+        ttk.Button(stitching, text="Record Corner", command=self._record_stitching_corner).grid(row=1, column=0, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(stitching, text="Delete Last Corner", command=self._delete_last_stitching_corner).grid(row=1, column=1, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(stitching, text="Clear Corners", command=self._clear_stitching_corners).grid(row=1, column=2, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(stitching, text="Run Offline Stitch", command=self._run_offline_stitching).grid(row=1, column=3, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Label(stitching, text="Rows").grid(row=2, column=0, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_rows_var, width=7).grid(row=2, column=1, sticky="ew", padx=2)
+        ttk.Label(stitching, text="Cols").grid(row=2, column=2, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_cols_var, width=7).grid(row=2, column=3, sticky="ew", padx=2)
+        ttk.Label(stitching, text="Speed %").grid(row=3, column=0, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_speed_var, width=7).grid(row=3, column=1, sticky="ew", padx=2)
+        ttk.Label(stitching, text="Settle s").grid(row=3, column=2, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_settle_seconds_var, width=7).grid(row=3, column=3, sticky="ew", padx=2)
+        ttk.Label(stitching, text="Frames/tile").grid(row=4, column=0, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_sample_frames_var, width=7).grid(row=4, column=1, sticky="ew", padx=2)
+        ttk.Label(stitching, text="Pixels/pulse").grid(row=4, column=2, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_pixels_per_pulse_var, width=7).grid(row=4, column=3, sticky="ew", padx=2)
+        ttk.Label(stitching, text="Output root").grid(row=5, column=0, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=5, column=1, columnspan=3, sticky="ew", padx=2)
+        ttk.Button(stitching, text="Start Stitching Scan", command=self._start_stitching_scan).grid(row=6, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Button(stitching, text="Stop Stitching Scan", command=self._stop_stitching_scan).grid(row=6, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=7, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=330).grid(row=8, column=0, columnspan=4, sticky="w")
+
         camera_controls = ttk.LabelFrame(right, text="Camera Controls", padding=8)
         camera_controls.grid(row=1, column=0, sticky="ew", pady=(8, 8))
         for col in range(4):
@@ -764,6 +831,7 @@ class ProbeStationApp(tk.Tk):
         spec = mode_panel_spec(self._current_mode())
         focus_visible = "focus_assist" in spec.visible_sections
         autofocus_visible = "autofocus" in spec.visible_sections
+        stitching_visible = "image_stitching" in spec.visible_sections
         if hasattr(self, "focus_panel"):
             if focus_visible:
                 self.focus_panel.grid()
@@ -774,6 +842,11 @@ class ProbeStationApp(tk.Tk):
                 self.autofocus_panel.grid()
             else:
                 self.autofocus_panel.grid_remove()
+        if hasattr(self, "stitching_panel"):
+            if stitching_visible:
+                self.stitching_panel.grid()
+            else:
+                self.stitching_panel.grid_remove()
 
     def _connect_motor(self) -> None:
         port = self.port_var.get().strip()
@@ -970,6 +1043,9 @@ class ProbeStationApp(tk.Tk):
         if self.autofocus.running:
             self._set_status("Autofocus is running; manual movement is disabled except Space/Esc.")
             return
+        if self.stitching.running:
+            self._set_status("Image stitching is running; manual movement is disabled except Space/Esc.")
+            return
         if not self.controller or not self.controller.is_open:
             self._set_status("Motor is not connected.")
             return
@@ -1009,6 +1085,11 @@ class ProbeStationApp(tk.Tk):
             self._set_manual_controls_enabled(True)
             LOG.info("Stop Autofocus requested by Space/controlled stop")
             self.device_queue.put(("af_status", "AF status: stop requested"))
+        if self.stitching.running:
+            self.stitching.stop_requested = True
+            self._set_manual_controls_enabled(True)
+            LOG.info("Stop Stitching requested by Space/controlled stop")
+            self.device_queue.put(("stitch_status", "Progress: stop requested"))
         if not self.controller or not self.controller.is_open:
             return
         self._set_status("Sending controlled stop...")
@@ -1031,6 +1112,11 @@ class ProbeStationApp(tk.Tk):
             self._set_manual_controls_enabled(True)
             LOG.warning("Emergency Stop during AF")
             self.device_queue.put(("af_status", "AF status: emergency stop requested"))
+        if self.stitching.running:
+            self.stitching.stop_requested = True
+            self._set_manual_controls_enabled(True)
+            LOG.warning("Emergency Stop during image stitching")
+            self.device_queue.put(("stitch_status", "Progress: emergency stop requested"))
         if not self.controller or not self.controller.is_open:
             return
 
@@ -1119,6 +1205,277 @@ class ProbeStationApp(tk.Tk):
                 self.device_queue.put(("error", f"Go To Best Z failed: {exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _record_stitching_corner(self) -> None:
+        self.mode_var.set(Mode.IMAGE_STITCHING.value)
+        self._on_mode_change()
+        if self.stitching.running:
+            self._set_status("Image stitching is running; cannot record corners now.")
+            return
+        missing = [axis for axis in ("X", "Y", "Z") if not self.position_available[axis]]
+        if missing:
+            self._set_status(f"Cannot record corner until positions are available: {', '.join(missing)}.")
+            return
+        corners = self.stitching.corners or []
+        if len(corners) >= 4:
+            self._set_status("Four stitching corners are already recorded. Delete or clear corners first.")
+            return
+        corner = SamplePlanePoint(
+            label=f"c{len(corners) + 1}",
+            x=int(self.absolute_pos["X"]),
+            y=int(self.absolute_pos["Y"]),
+            z=int(self.absolute_pos["Z"]),
+        )
+        corners.append(corner)
+        self.stitching.corners = corners
+        self._refresh_stitching_labels()
+        self._set_status(f"Recorded stitching corner {corner.label}: X={corner.x} Y={corner.y} Z={corner.z}.")
+
+    def _delete_last_stitching_corner(self) -> None:
+        if self.stitching.running:
+            self._set_status("Image stitching is running; cannot delete corners now.")
+            return
+        corners = self.stitching.corners or []
+        if not corners:
+            self._set_status("No stitching corners to delete.")
+            return
+        removed = corners.pop()
+        self.stitching.corners = corners
+        self._refresh_stitching_labels()
+        self._set_status(f"Deleted stitching corner {removed.label}.")
+
+    def _clear_stitching_corners(self) -> None:
+        if self.stitching.running:
+            self._set_status("Image stitching is running; cannot clear corners now.")
+            return
+        self.stitching.corners = []
+        self._refresh_stitching_labels()
+        self._set_status("Stitching corners cleared.")
+
+    def _refresh_stitching_labels(self) -> None:
+        corners = self.stitching.corners or []
+        self.stitch_corner_var.set(f"Corners: {len(corners)}/4")
+        if len(corners) >= 3:
+            try:
+                plane = fit_sample_plane(corners)
+                self.stitch_plane_var.set(
+                    f"Plane residual max={plane.max_abs_residual:.2f} rms={plane.rms_residual:.2f}"
+                )
+            except Exception as exc:
+                self.stitch_plane_var.set(f"Plane: invalid ({exc})")
+        else:
+            self.stitch_plane_var.set("Plane: not fitted")
+
+    def _read_stitching_params(self) -> tuple[int, int, int, float, int, float, Path]:
+        try:
+            rows = max(1, int(float(self.stitch_rows_var.get())))
+            cols = max(1, int(float(self.stitch_cols_var.get())))
+            speed = max(1, min(100, int(float(self.stitch_speed_var.get()))))
+            settle_seconds = max(0.0, float(self.stitch_settle_seconds_var.get()))
+            sample_frames = max(1, int(float(self.stitch_sample_frames_var.get())))
+            pixels_per_pulse = max(0.0001, float(self.stitch_pixels_per_pulse_var.get()))
+        except ValueError as exc:
+            raise ValueError("Image stitching parameters must be numbers.") from exc
+        output_root = Path(self.stitch_output_root_var.get()).expanduser()
+        return rows, cols, speed, settle_seconds, sample_frames, pixels_per_pulse, output_root
+
+    def _start_stitching_scan(self) -> None:
+        self.mode_var.set(Mode.IMAGE_STITCHING.value)
+        self._on_mode_change()
+        if self.stitching.running:
+            self._set_status("Image stitching scan is already running.")
+            return
+        if not self.camera.is_open:
+            self._set_status("Camera is not open; cannot start image stitching.")
+            return
+        if not self.controller or not self.controller.is_open:
+            self._set_status("Motor is not connected; cannot start image stitching.")
+            return
+        corners = list(self.stitching.corners or [])
+        if len(corners) != 4:
+            self._set_status("Record exactly four manually focused stitching corners before scanning.")
+            return
+        try:
+            rows, cols, speed, settle_seconds, sample_frames, pixels_per_pulse, output_root = self._read_stitching_params()
+            plane = fit_sample_plane(corners)
+            bounds = bounds_from_plane_points(corners)
+            tiles = generate_stitching_grid(bounds, rows=rows, cols=cols, plane=plane)
+        except Exception as exc:
+            self._set_status(f"Image stitching setup failed: {exc}")
+            return
+        if len(tiles) > 100:
+            self._set_status("Image stitching scan limited to 100 tiles for the first safe version.")
+            return
+        confirmed = messagebox.askyesno(
+            "Confirm Image Stitching Scan",
+            "即将根据四个手动对焦角点拟合样品平面，并自动移动 X/Y/Z 拍摄拼场图片。\n\n"
+            f"Tiles = {rows} x {cols} = {len(tiles)}\n"
+            f"Plane max residual = {plane.max_abs_residual:.2f} pulses\n"
+            "请确认扫描范围安全、物理急停可用、没有探针会碰撞。\n"
+            "软件急停不能替代物理急停。\n\n是否继续？",
+        )
+        if not confirmed:
+            self._set_status("Image stitching scan cancelled.")
+            return
+
+        self.stitching.running = True
+        self.stitching.stop_requested = False
+        self._set_manual_controls_enabled(False)
+        self.running_state_var.set("Running state: image stitching")
+        self.recent_command_var.set("Recent command: Start Image Stitching")
+        self.stitch_progress_var.set("Progress: starting")
+        LOG.info("Start Image Stitching: rows=%s cols=%s speed=%s", rows, cols, speed)
+        threading.Thread(
+            target=self._stitching_scan_worker,
+            args=(corners, plane, tiles, rows, cols, speed, settle_seconds, sample_frames, pixels_per_pulse, output_root),
+            daemon=True,
+        ).start()
+
+    def _stop_stitching_scan(self) -> None:
+        if not self.stitching.running:
+            self._set_status("Image stitching scan is not running.")
+            return
+        self.stitching.stop_requested = True
+        self.stitch_progress_var.set("Progress: stop requested")
+        self._set_status("Stopping image stitching scan...")
+        if self.controller and self.controller.is_open:
+            threading.Thread(target=self._safe_stop_worker, daemon=True).start()
+
+    def _stitching_scan_worker(
+        self,
+        corners: list[SamplePlanePoint],
+        plane,
+        tiles: list[TilePoint],
+        rows: int,
+        cols: int,
+        speed: int,
+        settle_seconds: float,
+        sample_frames: int,
+        pixels_per_pulse: float,
+        output_root: Path,
+    ) -> None:
+        saved_tiles: list[TileRecord] = []
+        store: StitchingSessionStore | None = None
+        try:
+            store = StitchingSessionStore.create(output_root)
+            self.device_queue.put(("stitch_output", f"Output: {store.path}"))
+            for index, tile in enumerate(tiles, start=1):
+                self._raise_if_stitching_stopped()
+                self.device_queue.put(("stitch_status", f"Progress: moving tile {index}/{len(tiles)}"))
+                self._move_to_absolute_position(tile.x, tile.y, tile.z, speed)
+                self._sleep_with_stitching_stop(settle_seconds)
+                frame, focus_score = self._capture_stable_stitching_frame(sample_frames)
+                record = TileRecord(
+                    row=tile.row,
+                    col=tile.col,
+                    x=tile.x,
+                    y=tile.y,
+                    z=tile.z,
+                    filename="",
+                    focus_score=focus_score,
+                )
+                saved = store.save_tile(frame, record)
+                saved_tiles.append(saved)
+                self.device_queue.put(("stitch_status", f"Progress: saved tile {index}/{len(tiles)}"))
+            store.write_metadata(
+                corners=corners,
+                tiles=saved_tiles,
+                settings={
+                    "rows": rows,
+                    "cols": cols,
+                    "speed": speed,
+                    "settle_seconds": settle_seconds,
+                    "sample_frames": sample_frames,
+                    "pixels_per_pulse": pixels_per_pulse,
+                },
+                plane=plane,
+            )
+            mosaic_path = stitch_session_by_metadata(store.path, pixels_per_pulse=pixels_per_pulse)
+            self.device_queue.put(("stitch_done", (store.path, mosaic_path)))
+        except InterruptedError:
+            if store is not None and saved_tiles:
+                store.write_metadata(
+                    corners=corners,
+                    tiles=saved_tiles,
+                    settings={"stopped": True, "pixels_per_pulse": pixels_per_pulse},
+                    plane=plane,
+                )
+            self.device_queue.put(("stitch_done", (store.path if store else None, None)))
+        except Exception as exc:
+            LOG.exception("image stitching scan failed")
+            if self.controller and self.controller.is_open:
+                try:
+                    self.controller.stop_all()
+                except Exception:
+                    LOG.exception("stop_all after image stitching failure failed")
+            self.device_queue.put(("stitch_error", f"Image stitching failed: {exc}"))
+
+    def _move_to_absolute_position(self, x: int, y: int, z: int, speed: int) -> None:
+        for axis, target in (("Z", z), ("X", x), ("Y", y)):
+            self._raise_if_stitching_stopped()
+            current = int(self.absolute_pos[axis])
+            delta = int(target) - current
+            if delta == 0:
+                continue
+            direction = 1 if delta > 0 else -1
+            controller_direction = logical_direction_to_controller_direction(axis, direction)
+            self.controller.move_relative(axis, controller_direction, abs(delta), speed)
+            self.absolute_pos[axis] = int(target)
+
+    def _capture_stable_stitching_frame(self, sample_frames: int):
+        best_frame = None
+        best_score = float("-inf")
+        local_rois = None
+        reference_frame = None
+        for _ in range(sample_frames):
+            self._raise_if_stitching_stopped()
+            with self.camera_lock:
+                frame = self.camera.read_frame()
+            if reference_frame is None:
+                reference_frame = frame.copy()
+            stabilized_frame, _motion_info = stabilize_frame_translation(reference_frame, frame)
+            if local_rois is None:
+                local_rois = auto_select_rois(stabilized_frame)
+            info = brightness_diagnostics(stabilized_frame)
+            focus_score = float(calculate_focus_index(stabilized_frame, local_rois))
+            if bool(info.get("overexposed", False)):
+                focus_score *= 0.75
+            if focus_score > best_score:
+                best_score = focus_score
+                best_frame = stabilized_frame.copy()
+            time.sleep(0.03)
+        if best_frame is None:
+            raise RuntimeError("no valid camera frame captured for stitching")
+        return best_frame, best_score
+
+    def _run_offline_stitching(self) -> None:
+        session_path = self.stitching.last_session_path
+        if session_path is None:
+            text = self.stitch_output_var.get().replace("Output:", "").strip()
+            if text and text != "--":
+                session_path = Path(text)
+        if session_path is None or not (session_path / "metadata.json").exists():
+            self._set_status("No stitching session metadata is available yet.")
+            return
+        try:
+            pixels_per_pulse = max(0.0001, float(self.stitch_pixels_per_pulse_var.get()))
+            mosaic_path = stitch_session_by_metadata(session_path, pixels_per_pulse=pixels_per_pulse)
+        except Exception as exc:
+            self._set_status(f"Offline stitch failed: {exc}")
+            return
+        self.stitching.last_mosaic_path = mosaic_path
+        self.stitch_output_var.set(f"Output: {mosaic_path}")
+        self._set_status(f"Offline stitched mosaic saved: {mosaic_path}")
+
+    def _sleep_with_stitching_stop(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self._raise_if_stitching_stopped()
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def _raise_if_stitching_stopped(self) -> None:
+        if self.stitching.stop_requested:
+            raise InterruptedError("image stitching stopped")
 
     def _start_autofocus(self) -> None:
         if not self.enable_autofocus:
@@ -1416,7 +1773,13 @@ class ProbeStationApp(tk.Tk):
     def _poll_positions(self) -> None:
         if self._closing:
             return
-        if self.controller and self.controller.is_open and not self.autofocus.running and not self._position_poll_running:
+        if (
+            self.controller
+            and self.controller.is_open
+            and not self.autofocus.running
+            and not self.stitching.running
+            and not self._position_poll_running
+        ):
             self._position_poll_running = True
 
             def worker() -> None:
@@ -1631,6 +1994,34 @@ class ProbeStationApp(tk.Tk):
                     self.af_status_var.set("AF status: failed")
                     self._set_status(str(payload))
                     self._record_mission_event("autofocus_failed", payload)
+                elif kind == "stitch_status":
+                    self.stitch_progress_var.set(str(payload))
+                elif kind == "stitch_output":
+                    self.stitch_output_var.set(str(payload))
+                elif kind == "stitch_done":
+                    session_path, mosaic_path = payload
+                    self.stitching.running = False
+                    self.stitching.stop_requested = False
+                    self._set_manual_controls_enabled(True)
+                    self.running_state_var.set("Running state: idle")
+                    if session_path is not None:
+                        self.stitching.last_session_path = Path(session_path)
+                    if mosaic_path is not None:
+                        self.stitching.last_mosaic_path = Path(mosaic_path)
+                        self.stitch_output_var.set(f"Output: {mosaic_path}")
+                        self.stitch_progress_var.set("Progress: completed")
+                        self._set_status(f"Image stitching completed: {mosaic_path}")
+                    else:
+                        self.stitch_progress_var.set("Progress: stopped")
+                        self._set_status("Image stitching stopped.")
+                elif kind == "stitch_error":
+                    self.stitching.running = False
+                    self.stitching.stop_requested = False
+                    self._set_manual_controls_enabled(True)
+                    self.running_state_var.set("Running state: error")
+                    self.recent_error_var.set(f"Recent error: {payload}")
+                    self.stitch_progress_var.set("Progress: failed")
+                    self._set_status(str(payload))
         except queue.Empty:
             pass
         self._schedule_after(50, self._drain_device_queue)
@@ -1654,6 +2045,7 @@ class ProbeStationApp(tk.Tk):
         )
         self.rel_pos_var.set(f"Rel X={rel['X']}  Y={rel['Y']}  Z={rel['Z']}")
         self._refresh_focus_assist_labels()
+        self._refresh_stitching_labels()
 
     def _mark_positions_available(self, positions: dict[str, int]) -> None:
         for axis in positions:
