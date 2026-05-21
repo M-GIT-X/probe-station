@@ -15,7 +15,7 @@ from tkinter import messagebox, ttk
 
 import numpy as np
 
-from camera_opencv import OpenCVCamera
+from camera_opencv import OpenCVCamera, choose_best_exposure_result, exposure_tuning_candidates
 from focus_metrics import (
     auto_select_rois,
     brightness_diagnostics,
@@ -47,11 +47,11 @@ INVERT_Y_DIRECTION = True
 INVERT_Z_DIRECTION = False
 
 SAFE_MODE = True
-SAFE_MAX_MANUAL_STEP = 50
-SAFE_MAX_MANUAL_SPEED = 5
-SAFE_MAX_AUTOFOCUS_RANGE = 100
-SAFE_MAX_AUTOFOCUS_STEP = 20
-SAFE_MAX_AUTOFOCUS_SPEED = 5
+SAFE_MAX_MANUAL_STEP = 2000
+SAFE_MAX_MANUAL_SPEED = 100
+SAFE_MAX_AUTOFOCUS_RANGE = 2000
+SAFE_MAX_AUTOFOCUS_STEP = 2000
+SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
 DEFAULT_WINDOW_GEOMETRY = "1120x700"
 MIN_WINDOW_WIDTH = 960
@@ -522,7 +522,7 @@ class ProbeStationApp(tk.Tk):
         move.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         for col in range(3):
             move.columnconfigure(col, weight=1)
-        ttk.Label(move, text="Step pulses").grid(row=0, column=0, sticky="w")
+        ttk.Label(move, text="Step pulses (<=2000)").grid(row=0, column=0, sticky="w")
         ttk.Entry(move, textvariable=self.step_var, width=8).grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Label(move, text="Speed %").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(move, textvariable=self.speed_var, width=8).grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
@@ -543,8 +543,10 @@ class ProbeStationApp(tk.Tk):
         self.manual_move_buttons[4].grid(row=5, column=0, sticky="ew", padx=2, pady=(10, 2))
         self.manual_move_buttons[5].grid(row=5, column=2, sticky="ew", padx=2, pady=(10, 2))
         ttk.Button(move, text="Software Emergency Stop  Esc", command=self._emergency_stop).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
-        ttk.Button(move, text="Set Current As Software Origin", command=self._set_software_origin).grid(
-            row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0)
+        self.software_origin_button = ttk.Button(
+            move,
+            text="Set Current As Software Origin",
+            command=self._set_software_origin,
         )
 
         pos = ttk.LabelFrame(middle, text="Position / Status", padding=8)
@@ -601,7 +603,7 @@ class ProbeStationApp(tk.Tk):
                 variable=self.af_mode_var,
                 command=self._on_autofocus_mode_change,
             ).grid(row=0, column=2, columnspan=2, sticky="w")
-            ttk.Label(autofocus, text="Range").grid(row=1, column=0, sticky="w")
+            ttk.Label(autofocus, text="Half-range").grid(row=1, column=0, sticky="w")
             self.af_range_entry = ttk.Entry(autofocus, textvariable=self.af_scan_range_var, width=7)
             self.af_range_entry.grid(row=1, column=1, sticky="ew", padx=2)
             ttk.Label(autofocus, text="Step").grid(row=1, column=2, sticky="w")
@@ -801,10 +803,11 @@ class ProbeStationApp(tk.Tk):
             self.focus_rois = None
             self.focus_reference_frame = None
             self.camera_status_var.set(f"Camera: opened index {index} backend {backend}")
+            self._auto_tune_exposure_for_focus()
             props = self.camera.get_camera_properties()
             self.exposure_var.set(str(props.get("exposure") or ""))
             self.gain_var.set(str(props.get("gain") or ""))
-            self._set_status("Camera opened with low-exposure OpenCV startup defaults.")
+            self._set_status("Camera opened. Exposure auto-tuned for focus.")
         else:
             self.camera_status_var.set("Camera: no-camera mode")
             self.video_label.configure(text="No camera", image="")
@@ -817,6 +820,49 @@ class ProbeStationApp(tk.Tk):
         self.camera_status_var.set("Camera: closed")
         self.video_label.configure(text="No camera", image="")
         self._set_status("Camera closed.")
+
+    def _auto_tune_exposure_for_focus(self) -> None:
+        if not self.camera.is_open:
+            return
+        samples: list[dict[str, float]] = []
+        try:
+            self.camera.set_auto_exposure(False)
+            self.camera.set_camera_property("gain", 0)
+            for exposure in exposure_tuning_candidates():
+                self.camera.set_camera_property("exposure", exposure)
+                time.sleep(0.08)
+                scores: list[float] = []
+                diagnostics: list[dict[str, float | bool]] = []
+                for _ in range(4):
+                    frame = self.camera.read_frame()
+                    if self.focus_rois is None:
+                        self.focus_rois = auto_select_rois(frame)
+                    scores.append(float(calculate_focus_index(frame, self.focus_rois)))
+                    diagnostics.append(brightness_diagnostics(frame))
+                score = robust_representative(scores)
+                mean_brightness = float(np.mean([float(item["mean_brightness"]) for item in diagnostics]))
+                saturation = float(np.mean([float(item["frame_saturation"]) for item in diagnostics]))
+                sample = {
+                    "exposure": float(exposure),
+                    "focus_score": score,
+                    "mean_brightness": mean_brightness,
+                    "saturation_fraction": saturation,
+                }
+                samples.append(sample)
+                LOG.info("camera exposure tune sample: %s", sample)
+            best = choose_best_exposure_result(samples)
+            self.camera.set_camera_property("exposure", best["exposure"])
+            self.camera.set_camera_property("gain", 0)
+            self.focus_rois = None
+            self.focus_reference_frame = None
+            LOG.info("camera exposure tune selected: %s", best)
+            self.camera_properties_var.set(
+                f"Auto exposure tune: exposure={best['exposure']} focus={best['focus_score']:.2f} "
+                f"saturation={best['saturation_fraction']:.3f}"
+            )
+        except Exception as exc:
+            LOG.exception("camera exposure auto-tune failed")
+            self.camera_properties_var.set(f"Auto exposure tune failed: {exc}")
 
     def _read_camera_properties(self) -> None:
         if not self.camera.is_open:
@@ -1067,9 +1113,10 @@ class ProbeStationApp(tk.Tk):
         confirmed = messagebox.askyesno(
             "Confirm Autofocus",
             "即将自动移动 Z 轴进行对焦。\n"
+            f"Half-range = {params.scan_range} pulses，表示从当前位置到任一方向边缘的距离；总扫描宽度约为 {params.scan_range * 2} pulses。\n"
             "请确认样品/探针/镜头安全。\n"
             "请确认物理急停可用。\n"
-            "第一次测试建议 scan_range <= 20, scan_step <= 5, speed <= 2。\n"
+            "第一次测试建议 half-range <= 20, step <= 5, speed <= 2。\n"
             "软件急停不能替代物理急停。\n"
             "是否继续？",
         )

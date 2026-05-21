@@ -76,7 +76,7 @@ button. 软件急停不能替代物理急停。
 3. Use `Auto Focus` only after manual movement and focus assist are stable.
 4. Before autofocus, manually move close to focus.
 5. First autofocus parameters:
-   - `scan_range = 20`
+   - `half-range = 20`
    - `scan_step = 5`
    - `speed = 1` or `2`
    - `settle_seconds = 0.5`
@@ -87,9 +87,11 @@ button. 软件急停不能替代物理急停。
 If OpenCV looks much brighter than the Windows Camera app:
 
 1. Open `Camera Controls`.
-2. Click `Read Camera Properties`.
-3. Click `Reduce Overexposure`.
-4. If still too bright, turn off `Auto Exposure`, set `exposure = -6`, `-7`, or
+2. On camera connection, the GUI automatically tests exposure values `-3` to `-11` and keeps
+   the exposure with the best focus score while avoiding heavy saturation.
+3. Click `Read Camera Properties`.
+4. Click `Reduce Overexposure` if the automatic exposure tune is still too bright.
+5. If still too bright, turn off `Auto Exposure`, set `exposure = -6`, `-7`, or
    `-8`, set `gain = 0`, then click `Apply Camera Settings`.
 
 Before autofocus, target `saturation_fraction < 0.05`; at minimum keep it below
@@ -108,11 +110,11 @@ warning and lets the user cancel or continue.
 
 `SAFE_MODE` is enabled in `gui_app.py`:
 
-- `SAFE_MAX_MANUAL_STEP = 50`
-- `SAFE_MAX_MANUAL_SPEED = 5`
-- `SAFE_MAX_AUTOFOCUS_RANGE = 100`
-- `SAFE_MAX_AUTOFOCUS_STEP = 20`
-- `SAFE_MAX_AUTOFOCUS_SPEED = 5`
+- `SAFE_MAX_MANUAL_STEP = 2000`
+- `SAFE_MAX_MANUAL_SPEED = 100`
+- `SAFE_MAX_AUTOFOCUS_RANGE = 2000`
+- `SAFE_MAX_AUTOFOCUS_STEP = 2000`
+- `SAFE_MAX_AUTOFOCUS_SPEED = 100`
 
 Inputs above those limits are clamped and logged.
 
@@ -137,8 +139,8 @@ software-inverted. Z keeps the successful Manual Focus Assist direction.
 - `stage_protocol.py`: 12-byte protocol frame helpers for X/Y/Z/ALL only.
 - `stage_controller.py`: serial connection, D4 realtime-upload disable on open,
   movement, B5 arrival wait, position reads, stop, and emergency stop.
-- `camera_opencv.py`: OpenCV camera open/close/read, backend selection, property
-  controls, and `reduce_overexposure()`.
+- `camera_opencv.py`: OpenCV camera open/close/read, backend selection, exposure
+  selection helpers, property controls, and `reduce_overexposure()`.
 - `focus_metrics.py`: automatic ROI selection, relative focus index, robust
   representative score, and brightness/saturation diagnostics.
 - `app_gui.py`: compatibility shim importing from `gui_app.py`.
@@ -148,13 +150,15 @@ software-inverted. Z keeps the successful Manual Focus Assist direction.
 `ProbeStationApp._autofocus_worker()` performs the autofocus scan:
 
 1. sample baseline at offset 0;
-2. in `Semi Auto`, scan the user range/step once;
-3. in `Full Auto`, scan coarse, then refine around the best point with smaller
+2. `half-range` means distance from the current Z to either scan edge; the total
+   scanned width is approximately `2 * half-range`;
+3. in `Semi Auto`, scan the user half-range/step once;
+4. in `Full Auto`, scan coarse, then refine around the best point with smaller
    range and step;
-4. sample focus index at each point;
-5. choose a near-best stable point;
-6. move Z to the final offset;
-7. confirm focus score.
+5. sample focus index at each point;
+6. choose a near-best stable point;
+7. move Z to the final offset;
+8. confirm focus score.
 
 Before focus scoring, frames are translated against a reference frame using
 phase correlation. This reduces table/camera jitter in the focus metric. It

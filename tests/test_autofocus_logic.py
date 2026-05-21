@@ -5,6 +5,9 @@ from gui_app import (
     AutofocusParams,
     AutofocusPassPlan,
     AutofocusSamplePoint,
+    SAFE_MAX_AUTOFOCUS_RANGE,
+    SAFE_MAX_AUTOFOCUS_SPEED,
+    SAFE_MAX_AUTOFOCUS_STEP,
     SAFE_MAX_MANUAL_SPEED,
     SAFE_MAX_MANUAL_STEP,
     build_autofocus_pass_plan,
@@ -32,18 +35,20 @@ class DirectionMappingTest(unittest.TestCase):
 
 
 class AutofocusLogicTest(unittest.TestCase):
-    def test_safe_mode_clamps_manual_motion_params(self):
-        pulses, speed, changed = clamp_manual_motion_params(500, 20)
+    def test_safe_mode_allows_manual_motion_up_to_2000_pulses_and_full_protocol_speed(self):
+        pulses, speed, changed = clamp_manual_motion_params(5000, 200)
 
         self.assertTrue(changed)
         self.assertEqual(pulses, SAFE_MAX_MANUAL_STEP)
         self.assertEqual(speed, SAFE_MAX_MANUAL_SPEED)
+        self.assertEqual(SAFE_MAX_MANUAL_STEP, 2000)
+        self.assertEqual(SAFE_MAX_MANUAL_SPEED, 100)
 
-    def test_safe_mode_clamps_autofocus_params(self):
+    def test_safe_mode_allows_autofocus_range_step_up_to_2000_and_full_protocol_speed(self):
         params = AutofocusParams(
-            scan_range=500,
-            scan_step=100,
-            autofocus_speed=20,
+            scan_range=5000,
+            scan_step=5000,
+            autofocus_speed=200,
             settle_seconds=0.5,
             sample_seconds=1.5,
             near_best_ratio=0.96,
@@ -52,9 +57,15 @@ class AutofocusLogicTest(unittest.TestCase):
         clamped, changed = clamp_autofocus_params(params)
 
         self.assertTrue(changed)
-        self.assertEqual(clamped.scan_range, 100)
-        self.assertEqual(clamped.scan_step, 20)
-        self.assertEqual(clamped.autofocus_speed, 5)
+        self.assertEqual(clamped.scan_range, SAFE_MAX_AUTOFOCUS_RANGE)
+        self.assertEqual(clamped.scan_step, SAFE_MAX_AUTOFOCUS_STEP)
+        self.assertEqual(clamped.autofocus_speed, SAFE_MAX_AUTOFOCUS_SPEED)
+        self.assertEqual(SAFE_MAX_AUTOFOCUS_RANGE, 2000)
+        self.assertEqual(SAFE_MAX_AUTOFOCUS_STEP, 2000)
+        self.assertEqual(SAFE_MAX_AUTOFOCUS_SPEED, 100)
+
+    def test_scan_range_is_half_range_around_current_position(self):
+        self.assertEqual(build_scan_offsets(20, 10), [-20, -10, 0, 10, 20])
 
     def test_scan_offsets_include_positive_range_even_when_step_does_not_land_on_it(self):
         self.assertEqual(build_scan_offsets(20, 6), [-20, -14, -8, -2, 4, 10, 16, 20])
@@ -68,14 +79,15 @@ class AutofocusLogicTest(unittest.TestCase):
         )
 
     def test_full_auto_builds_coarse_to_fine_passes_from_range_only(self):
-        params = AutofocusParams(scan_range=40, scan_step=99)
+        params = AutofocusParams(scan_range=80, scan_step=99)
 
         passes = build_autofocus_pass_plan(params, AutofocusMode.FULL)
 
         self.assertGreater(len(passes), 1)
-        self.assertEqual(passes[0].scan_range, 40)
+        self.assertEqual(passes[0].scan_range, 80)
         self.assertLess(passes[-1].scan_range, passes[0].scan_range)
-        self.assertLess(passes[-1].scan_step, passes[0].scan_step)
+        self.assertEqual(passes[1].scan_step, max(1, passes[0].scan_step // 2))
+        self.assertEqual(passes[2].scan_step, max(1, passes[1].scan_step // 2))
 
     def test_final_point_prefers_stability_inside_near_best_band(self):
         points = [

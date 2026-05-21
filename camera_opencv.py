@@ -39,6 +39,30 @@ def startup_camera_settings(backend: str) -> dict[str, float | bool]:
         "gain": 0.0,
     }
 
+
+def exposure_tuning_candidates() -> list[int]:
+    return list(range(-3, -12, -1))
+
+
+def choose_best_exposure_result(samples: list[dict[str, float]]) -> dict[str, float]:
+    usable = [
+        sample
+        for sample in samples
+        if float(sample.get("saturation_fraction", 1.0)) <= 0.10
+        and float(sample.get("mean_brightness", 128.0)) < 230.0
+    ]
+    candidates = usable or samples
+    if not candidates:
+        return {"exposure": -7.0, "focus_score": 0.0, "saturation_fraction": 1.0, "mean_brightness": 0.0}
+    return max(
+        candidates,
+        key=lambda sample: (
+            float(sample.get("focus_score", 0.0)),
+            -float(sample.get("saturation_fraction", 1.0)),
+            -abs(float(sample.get("mean_brightness", 128.0)) - 128.0),
+        ),
+    )
+
 PROPERTY_NAMES = {
     "brightness": "CAP_PROP_BRIGHTNESS",
     "contrast": "CAP_PROP_CONTRAST",
@@ -206,7 +230,7 @@ class OpenCVCamera:
             return result
         LOG.info("reduce overexposure started")
         self.set_auto_exposure(False)
-        for exposure in (-4, -5, -6, -7, -8, -9):
+        for exposure in exposure_tuning_candidates():
             result["exposure"] = exposure
             self.set_camera_property("exposure", exposure)
             saturation = self._read_saturation_fraction()
