@@ -221,6 +221,10 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
     )
 
 
+def mode_status_label_row() -> int:
+    return len(Mode)
+
+
 @dataclass(frozen=True)
 class AutofocusParams:
     scan_range: int = 20
@@ -579,7 +583,9 @@ class ProbeStationApp(tk.Tk):
                 variable=self.mode_var,
                 command=self._on_mode_change,
             ).grid(row=row, column=0, sticky="w")
-        ttk.Label(modes, textvariable=self.current_mode_var, foreground="#005a8d").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(modes, textvariable=self.current_mode_var, foreground="#005a8d").grid(
+            row=mode_status_label_row(), column=0, sticky="w", pady=(6, 0)
+        )
 
         self.manual_panel = ttk.LabelFrame(left, text="Manual Move", padding=8)
         move = self.manual_panel

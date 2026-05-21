@@ -8,6 +8,7 @@ from gui_app import (
     Mode,
     VIDEO_PREVIEW_MAX_HEIGHT,
     VIDEO_PREVIEW_MAX_WIDTH,
+    mode_status_label_row,
     mode_panel_spec,
 )
 
@@ -21,6 +22,10 @@ class AppModeTitleTest(unittest.TestCase):
             [mode.value for mode in Mode],
             ["Manual Mode", "Manual Focus Assist", "Auto Focus", "Image Stitching"],
         )
+
+    def test_mode_status_label_is_below_all_mode_buttons(self):
+        self.assertEqual(mode_status_label_row(), len(Mode))
+        self.assertGreater(mode_status_label_row(), list(Mode).index(Mode.IMAGE_STITCHING))
 
     def test_mode_specs_show_different_function_sections(self):
         manual = mode_panel_spec(Mode.MANUAL)
