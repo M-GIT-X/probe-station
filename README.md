@@ -59,7 +59,7 @@ Use the GUI `Mode Selector` to switch between:
 
 ## Shortcuts
 
-- `A` / `D` = X+ / X-
+- `A` / `D` = X- / X+
 - `W` / `S` = Y+ / Y-
 - `Q` / `E` = Z- / Z+
 - `Space` = all-axis decelerated stop
@@ -67,6 +67,10 @@ Use the GUI `Mode Selector` to switch between:
 
 `E` is Z+ only. Software emergency stop is `Esc` or the GUI emergency-stop
 button. 软件急停不能替代物理急停。
+
+Press `Enter` after editing numeric fields such as step, speed, scan range, or
+camera exposure to return focus to the main window before using movement
+shortcuts.
 
 ## Real-Hardware Test Order
 

@@ -1,6 +1,6 @@
 import unittest
 
-from gui_app import should_ignore_axis_shortcut
+from gui_app import mission_log_message_for_event, should_ignore_axis_shortcut, should_return_focus_to_root_on_enter
 
 
 class FakeWidget:
@@ -20,6 +20,22 @@ class KeyboardShortcutTest(unittest.TestCase):
     def test_axis_shortcuts_work_outside_text_inputs(self):
         self.assertFalse(should_ignore_axis_shortcut(FakeWidget("Button")))
         self.assertFalse(should_ignore_axis_shortcut(None))
+
+    def test_enter_returns_focus_to_manual_control_from_text_inputs(self):
+        for widget_class in ("Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox"):
+            with self.subTest(widget_class=widget_class):
+                self.assertTrue(should_return_focus_to_root_on_enter(FakeWidget(widget_class)))
+
+    def test_enter_does_not_steal_focus_from_regular_controls(self):
+        self.assertFalse(should_return_focus_to_root_on_enter(FakeWidget("Button")))
+        self.assertFalse(should_return_focus_to_root_on_enter(None))
+
+    def test_mission_log_includes_only_key_events(self):
+        self.assertEqual(
+            mission_log_message_for_event("camera_opened", "index 0 backend DSHOW"),
+            "CAMERA ONLINE. Optical feed established: index 0 backend DSHOW.",
+        )
+        self.assertIsNone(mission_log_message_for_event("positions", {"X": 1}))
 
 
 if __name__ == "__main__":

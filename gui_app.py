@@ -118,10 +118,35 @@ def should_ignore_axis_shortcut(widget) -> bool:
     return widget_class in {"Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox"}
 
 
+def should_return_focus_to_root_on_enter(widget) -> bool:
+    return should_ignore_axis_shortcut(widget)
+
+
+def mission_log_message_for_event(kind: str, payload: object = None) -> str | None:
+    text = "" if payload is None else str(payload)
+    messages = {
+        "motor_connecting": f"STAGE LINK INITIATED. Opening controller channel on {text}.",
+        "motor_connected": "STAGE ONLINE. Motion controller handshake confirmed.",
+        "motor_disconnected": "STAGE OFFLINE. Motion channel secured.",
+        "camera_opened": f"CAMERA ONLINE. Optical feed established: {text}.",
+        "camera_closed": "CAMERA OFFLINE. Optical feed secured.",
+        "focus_assist_started": "FOCUS ASSIST ARMED. Manual Z sweep may proceed.",
+        "focus_assist_stopped": "FOCUS ASSIST STANDBY. Manual focus recording halted.",
+        "best_focus_reset": "FOCUS REFERENCE RESET. Previous best-focus record cleared.",
+        "autofocus_started": "AUTOFOCUS SEQUENCE START. Z-axis scan authorized.",
+        "autofocus_completed": "AUTOFOCUS COMPLETE. Final focus position confirmed.",
+        "autofocus_stopped": "AUTOFOCUS HOLD. Stop command acknowledged.",
+        "autofocus_failed": f"AUTOFOCUS ABORT. Fault received: {text}.",
+        "controlled_stop": "CONTROLLED STOP COMMAND SENT. All axes ordered to halt.",
+        "emergency_stop": "SOFTWARE EMERGENCY STOP SENT. Verify physical system state immediately.",
+    }
+    return messages.get(kind)
+
+
 def manual_shortcut_mapping(key: str) -> tuple[str, int] | None:
     mapping = {
-        "a": ("X", +1),
-        "d": ("X", -1),
+        "a": ("X", -1),
+        "d": ("X", +1),
         "w": ("Y", +1),
         "s": ("Y", -1),
         "q": ("Z", -1),
@@ -373,9 +398,11 @@ class ProbeStationApp(tk.Tk):
         self._position_poll_running = False
         self._closing = False
         self._after_ids: set[str] = set()
+        self.mission_log_lines: list[str] = []
 
         self._build_ui()
         self._bind_keys()
+        self.bind_all("<Return>", self._return_focus_to_root)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._schedule_after(50, self._drain_device_queue)
@@ -529,8 +556,8 @@ class ProbeStationApp(tk.Tk):
 
         self.manual_move_buttons = [
             ttk.Button(move, text="Y+  W", command=lambda: self._move("Y", +1)),
-            ttk.Button(move, text="X+  A", command=lambda: self._move("X", +1)),
-            ttk.Button(move, text="X-  D", command=lambda: self._move("X", -1)),
+            ttk.Button(move, text="X-  A", command=lambda: self._move("X", -1)),
+            ttk.Button(move, text="X+  D", command=lambda: self._move("X", +1)),
             ttk.Button(move, text="Y-  S", command=lambda: self._move("Y", -1)),
             ttk.Button(move, text="Z-  Q", command=lambda: self._move("Z", -1)),
             ttk.Button(move, text="Z+  E", command=lambda: self._move("Z", +1)),
@@ -559,10 +586,17 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(pos, textvariable=self.running_state_var).grid(row=5, column=0, sticky="w")
         ttk.Label(pos, textvariable=self.debug_log_var, wraplength=310).grid(row=6, column=0, sticky="w")
 
+        mission = ttk.LabelFrame(middle, text="Mission Log", padding=8)
+        mission.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        mission.columnconfigure(0, weight=1)
+        self.mission_log_text = tk.Text(mission, height=7, width=42, wrap="word", state="disabled")
+        self.mission_log_text.grid(row=0, column=0, sticky="ew")
+        self._append_mission_log("SYSTEM READY. Awaiting operator command.")
+
         if self.enable_focus_assist:
             self.focus_panel = ttk.LabelFrame(middle, text="手动辅助对焦 Manual Focus Assist", padding=8)
             focus = self.focus_panel
-            focus.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+            focus.grid(row=2, column=0, sticky="ew", pady=(0, 8))
             focus.columnconfigure(0, weight=1)
             focus.columnconfigure(1, weight=1)
             ttk.Label(focus, textvariable=self.focus_assist_message_var, wraplength=300).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -586,7 +620,7 @@ class ProbeStationApp(tk.Tk):
         if self.enable_autofocus:
             self.autofocus_panel = ttk.LabelFrame(middle, text="Conservative Full Scan Autofocus / 保守 Z 轴自动对焦", padding=8)
             autofocus = self.autofocus_panel
-            autofocus.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+            autofocus.grid(row=2, column=0, sticky="ew", pady=(0, 8))
             for col in range(4):
                 autofocus.columnconfigure(col, weight=1)
             ttk.Radiobutton(
@@ -666,18 +700,18 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(camera_controls, textvariable=self.camera_properties_var, wraplength=310).grid(row=6, column=0, columnspan=4, sticky="w")
 
         focus_info = ttk.LabelFrame(middle, text="Focus Info", padding=8)
-        focus_info.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        focus_info.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         for row, variable in enumerate(
             [self.focus_var, self.brightness_var, self.saturation_var, self.underexposed_var, self.exposure_warning_var]
         ):
             ttk.Label(focus_info, textvariable=variable).grid(row=row, column=0, sticky="w")
 
         mode_panel = ttk.LabelFrame(middle, text="Mode-specific panel", padding=8)
-        mode_panel.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        mode_panel.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(mode_panel, textvariable=self.mode_message_var, wraplength=310).grid(row=0, column=0, sticky="w")
 
         warning = ttk.Label(middle, textvariable=self.status_var, wraplength=360, foreground="#8a4b00")
-        warning.grid(row=4, column=0, sticky="ew")
+        warning.grid(row=5, column=0, sticky="ew")
 
         video_frame = ttk.LabelFrame(right, text="Camera Preview", padding=4)
         video_frame.grid(row=0, column=0, sticky="ne")
@@ -699,6 +733,12 @@ class ProbeStationApp(tk.Tk):
             return
         axis, direction = mapped
         self._move(axis, direction)
+
+    def _return_focus_to_root(self, event):
+        if should_return_focus_to_root_on_enter(getattr(event, "widget", None)):
+            self.focus_set()
+            return "break"
+        return None
 
     def _current_mode(self) -> Mode:
         try:
@@ -746,6 +786,7 @@ class ProbeStationApp(tk.Tk):
             )
             return
         self._set_status(f"Opening motor controller on {port}...")
+        self._record_mission_event("motor_connecting", port)
 
         def worker() -> None:
             controller = None
@@ -773,6 +814,7 @@ class ProbeStationApp(tk.Tk):
             self.controller.close()
             self.motor_status_var.set("Motor: disconnected")
             self._set_status("Motor disconnected.")
+            self._record_mission_event("motor_disconnected")
         except Exception as exc:
             LOG.exception("motor disconnect failed")
             self._set_status(f"Motor disconnect failed: {exc}")
@@ -808,6 +850,7 @@ class ProbeStationApp(tk.Tk):
             self.exposure_var.set(str(props.get("exposure") or ""))
             self.gain_var.set(str(props.get("gain") or ""))
             self._set_status("Camera opened. Exposure auto-tuned for focus.")
+            self._record_mission_event("camera_opened", f"index {index} backend {backend}")
         else:
             self.camera_status_var.set("Camera: no-camera mode")
             self.video_label.configure(text="No camera", image="")
@@ -820,6 +863,7 @@ class ProbeStationApp(tk.Tk):
         self.camera_status_var.set("Camera: closed")
         self.video_label.configure(text="No camera", image="")
         self._set_status("Camera closed.")
+        self._record_mission_event("camera_closed")
 
     def _auto_tune_exposure_for_focus(self) -> None:
         if not self.camera.is_open:
@@ -959,6 +1003,7 @@ class ProbeStationApp(tk.Tk):
 
     def _stop_all(self) -> None:
         self.recent_command_var.set("Recent command: Stop all axes")
+        self._record_mission_event("controlled_stop")
         if self.autofocus.running:
             self.autofocus.stop_requested = True
             self._set_manual_controls_enabled(True)
@@ -980,6 +1025,7 @@ class ProbeStationApp(tk.Tk):
     def _emergency_stop(self) -> None:
         self.recent_command_var.set("Recent command: Software emergency stop")
         self._set_status("SOFTWARE emergency stop sent. 软件急停不能替代物理急停。")
+        self._record_mission_event("emergency_stop")
         if self.autofocus.running:
             self.autofocus.stop_requested = True
             self._set_manual_controls_enabled(True)
@@ -1014,11 +1060,13 @@ class ProbeStationApp(tk.Tk):
             LOG.warning("camera not opened while starting manual focus assist")
             self.focus_assist_message_var.set("相机未打开，无法进行 focus assist")
         self._set_status("Manual focus assist started. Move Z manually to collect focus samples.")
+        self._record_mission_event("focus_assist_started")
 
     def _stop_focus_assist(self) -> None:
         self.manual_focus_assist.recording = False
         self._refresh_focus_assist_labels()
         self._set_status("Manual focus assist stopped.")
+        self._record_mission_event("focus_assist_stopped")
 
     def _reset_best_focus(self) -> None:
         self.manual_focus_assist.reset_best(keep_recording=self.manual_focus_assist.recording)
@@ -1027,6 +1075,7 @@ class ProbeStationApp(tk.Tk):
         self._draw_focus_curve()
         self._refresh_focus_assist_labels()
         self._set_status("Manual focus best record reset.")
+        self._record_mission_event("best_focus_reset")
 
     def _go_to_best_z(self) -> None:
         best_z_abs = self.manual_focus_assist.best_z_abs
@@ -1134,6 +1183,7 @@ class ProbeStationApp(tk.Tk):
         self._draw_autofocus_plot()
         LOG.info("Start Autofocus")
         LOG.info("Autofocus parameters: %s", params)
+        self._record_mission_event("autofocus_started")
         threading.Thread(target=self._autofocus_worker, args=(params, self._current_autofocus_mode()), daemon=True).start()
 
     def _stop_autofocus(self) -> None:
@@ -1144,6 +1194,7 @@ class ProbeStationApp(tk.Tk):
         LOG.info("Stop Autofocus")
         self.af_status_var.set("AF status: stop requested")
         self._set_status("Stopping autofocus...")
+        self._record_mission_event("autofocus_stopped")
         if self.controller and self.controller.is_open:
             threading.Thread(target=self._safe_stop_worker, daemon=True).start()
 
@@ -1528,6 +1579,7 @@ class ProbeStationApp(tk.Tk):
                         self._mark_positions_available(positions)
                         self._update_position_labels()
                     self._set_status("Motor connected. D4 realtime upload disable was sent.")
+                    self._record_mission_event("motor_connected")
                 elif kind == "positions":
                     self.absolute_pos.update(payload)
                     self._mark_positions_available(payload)
@@ -1566,6 +1618,10 @@ class ProbeStationApp(tk.Tk):
                     self.running_state_var.set("Running state: idle")
                     self.af_status_var.set(f"AF status: {payload}")
                     self._set_status(str(payload))
+                    if "completed" in str(payload).lower():
+                        self._record_mission_event("autofocus_completed")
+                    else:
+                        self._record_mission_event("autofocus_stopped")
                 elif kind == "af_error":
                     self.autofocus.running = False
                     self.autofocus.stop_requested = False
@@ -1574,6 +1630,7 @@ class ProbeStationApp(tk.Tk):
                     self.recent_error_var.set(f"Recent error: {payload}")
                     self.af_status_var.set("AF status: failed")
                     self._set_status(str(payload))
+                    self._record_mission_event("autofocus_failed", payload)
         except queue.Empty:
             pass
         self._schedule_after(50, self._drain_device_queue)
@@ -1698,6 +1755,25 @@ class ProbeStationApp(tk.Tk):
     def _set_status(self, message: str) -> None:
         LOG.info(message)
         self.status_var.set(message)
+
+    def _record_mission_event(self, kind: str, payload: object = None) -> None:
+        message = mission_log_message_for_event(kind, payload)
+        if message is not None:
+            self._append_mission_log(message)
+
+    def _append_mission_log(self, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        line = f"T+ {timestamp}  {message}"
+        self.mission_log_lines.append(line)
+        self.mission_log_lines = self.mission_log_lines[-80:]
+        text_widget = getattr(self, "mission_log_text", None)
+        if text_widget is None:
+            return
+        text_widget.configure(state="normal")
+        text_widget.delete("1.0", tk.END)
+        text_widget.insert(tk.END, "\n".join(self.mission_log_lines))
+        text_widget.configure(state="disabled")
+        text_widget.see(tk.END)
 
     def _on_close(self) -> None:
         self._closing = True
