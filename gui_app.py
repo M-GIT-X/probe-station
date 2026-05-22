@@ -28,6 +28,7 @@ from sample_plane import SamplePlanePoint, bounds_from_plane_points, fit_sample_
 from scan_plan import TilePoint, generate_stitching_grid
 from stage_controller import StageController
 from stitching_store import StitchingSessionStore, TileRecord
+from stitching_view_model import build_stitching_view_model
 
 
 LOG = logging.getLogger(__name__)
@@ -281,12 +282,15 @@ class StitchingRunState:
     running: bool = False
     stop_requested: bool = False
     corners: list[SamplePlanePoint] | None = None
+    planned_tiles: list[TilePoint] | None = None
+    current_tile_index: int | None = None
     last_session_path: Path | None = None
     last_mosaic_path: Path | None = None
 
     def reset_run(self) -> None:
         self.running = False
         self.stop_requested = False
+        self.current_tile_index = None
 
 
 def clamp_autofocus_params(params: AutofocusParams) -> tuple[AutofocusParams, bool]:
@@ -747,6 +751,13 @@ class ProbeStationApp(tk.Tk):
         ttk.Button(stitching, text="Stop Stitching Scan", command=self._stop_stitching_scan).grid(row=6, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
         ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=7, column=0, columnspan=4, sticky="w")
         ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=330).grid(row=8, column=0, columnspan=4, sticky="w")
+        self.stitch_notebook = ttk.Notebook(stitching)
+        self.stitch_notebook.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.stitch_plane_tab = ttk.Frame(self.stitch_notebook, padding=4)
+        self.stitch_notebook.add(self.stitch_plane_tab, text="Plane View")
+        self.stitch_plane_canvas = tk.Canvas(self.stitch_plane_tab, width=320, height=180, bg="#101820", highlightthickness=0)
+        self.stitch_plane_canvas.grid(row=0, column=0, sticky="ew")
+        self._draw_stitching_plane_view()
 
         camera_controls = ttk.LabelFrame(right, text="Camera Controls", padding=8)
         camera_controls.grid(row=1, column=0, sticky="ew", pady=(8, 8))
@@ -1235,6 +1246,7 @@ class ProbeStationApp(tk.Tk):
         corners.append(corner)
         self.stitching.corners = corners
         self._refresh_stitching_labels()
+        self._draw_stitching_plane_view()
         self._set_status(f"Recorded stitching corner {corner.label}: X={corner.x} Y={corner.y} Z={corner.z}.")
 
     def _delete_last_stitching_corner(self) -> None:
@@ -1248,6 +1260,7 @@ class ProbeStationApp(tk.Tk):
         removed = corners.pop()
         self.stitching.corners = corners
         self._refresh_stitching_labels()
+        self._draw_stitching_plane_view()
         self._set_status(f"Deleted stitching corner {removed.label}.")
 
     def _clear_stitching_corners(self) -> None:
@@ -1255,7 +1268,10 @@ class ProbeStationApp(tk.Tk):
             self._set_status("Image stitching is running; cannot clear corners now.")
             return
         self.stitching.corners = []
+        self.stitching.planned_tiles = []
+        self.stitching.current_tile_index = None
         self._refresh_stitching_labels()
+        self._draw_stitching_plane_view()
         self._set_status("Stitching corners cleared.")
 
     def _refresh_stitching_labels(self) -> None:
@@ -1271,6 +1287,47 @@ class ProbeStationApp(tk.Tk):
                 self.stitch_plane_var.set(f"Plane: invalid ({exc})")
         else:
             self.stitch_plane_var.set("Plane: not fitted")
+
+    def _draw_stitching_plane_view(self) -> None:
+        canvas = getattr(self, "stitch_plane_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = max(10, canvas.winfo_width() or 320)
+        height = max(10, canvas.winfo_height() or 180)
+        margin = 18
+        canvas.create_rectangle(0, 0, width, height, fill="#101820", outline="")
+        corners = self.stitching.corners or []
+        tiles = self.stitching.planned_tiles or []
+        if not corners and not tiles:
+            canvas.create_text(10, 10, anchor="nw", fill="#e6edf3", text="Record focused corners to preview the scan plane.")
+            return
+        model = build_stitching_view_model(corners, tiles, current_tile_index=self.stitching.current_tile_index)
+
+        def xy(point):
+            x = margin + point.nx * max(1, width - margin * 2)
+            y = margin + point.ny * max(1, height - margin * 2)
+            return x, y
+
+        if len(model.corners) >= 2:
+            polygon = []
+            for point in model.corners:
+                polygon.extend(xy(point))
+            canvas.create_line(*polygon, fill="#f0c808", width=2)
+            if len(model.corners) >= 3:
+                canvas.create_line(*xy(model.corners[-1]), *xy(model.corners[0]), fill="#f0c808", width=2)
+        for point in model.tiles:
+            x, y = xy(point)
+            fill = "#2f81f7"
+            if point.state == "done":
+                fill = "#2ea043"
+            elif point.state == "current":
+                fill = "#ff7b72"
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=fill, outline="")
+        for point in model.corners:
+            x, y = xy(point)
+            canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ffd33d", outline="#ffffff")
+            canvas.create_text(x + 7, y - 7, anchor="w", fill="#e6edf3", text=f"{point.label} z={point.z}")
 
     def _read_stitching_params(self) -> tuple[int, int, int, float, int, float, Path]:
         try:
@@ -1306,6 +1363,9 @@ class ProbeStationApp(tk.Tk):
             plane = fit_sample_plane(corners)
             bounds = bounds_from_plane_points(corners)
             tiles = generate_stitching_grid(bounds, rows=rows, cols=cols, plane=plane)
+            self.stitching.planned_tiles = tiles
+            self.stitching.current_tile_index = None
+            self._draw_stitching_plane_view()
         except Exception as exc:
             self._set_status(f"Image stitching setup failed: {exc}")
             return
@@ -1367,6 +1427,7 @@ class ProbeStationApp(tk.Tk):
             self.device_queue.put(("stitch_output", f"Output: {store.path}"))
             for index, tile in enumerate(tiles, start=1):
                 self._raise_if_stitching_stopped()
+                self.device_queue.put(("stitch_tile_index", index - 1))
                 self.device_queue.put(("stitch_status", f"Progress: moving tile {index}/{len(tiles)}"))
                 self._move_to_absolute_position(tile.x, tile.y, tile.z, speed)
                 self._sleep_with_stitching_stop(settle_seconds)
@@ -2002,6 +2063,9 @@ class ProbeStationApp(tk.Tk):
                     self._record_mission_event("autofocus_failed", payload)
                 elif kind == "stitch_status":
                     self.stitch_progress_var.set(str(payload))
+                elif kind == "stitch_tile_index":
+                    self.stitching.current_tile_index = int(payload)
+                    self._draw_stitching_plane_view()
                 elif kind == "stitch_output":
                     self.stitch_output_var.set(str(payload))
                 elif kind == "stitch_done":
@@ -2013,21 +2077,26 @@ class ProbeStationApp(tk.Tk):
                     if session_path is not None:
                         self.stitching.last_session_path = Path(session_path)
                     if mosaic_path is not None:
+                        self.stitching.current_tile_index = None
                         self.stitching.last_mosaic_path = Path(mosaic_path)
                         self.stitch_output_var.set(f"Output: {mosaic_path}")
                         self.stitch_progress_var.set("Progress: completed")
                         self._set_status(f"Image stitching completed: {mosaic_path}")
                     else:
+                        self.stitching.current_tile_index = None
                         self.stitch_progress_var.set("Progress: stopped")
                         self._set_status("Image stitching stopped.")
+                    self._draw_stitching_plane_view()
                 elif kind == "stitch_error":
                     self.stitching.running = False
                     self.stitching.stop_requested = False
+                    self.stitching.current_tile_index = None
                     self._set_manual_controls_enabled(True)
                     self.running_state_var.set("Running state: error")
                     self.recent_error_var.set(f"Recent error: {payload}")
                     self.stitch_progress_var.set("Progress: failed")
                     self._set_status(str(payload))
+                    self._draw_stitching_plane_view()
         except queue.Empty:
             pass
         self._schedule_after(50, self._drain_device_queue)

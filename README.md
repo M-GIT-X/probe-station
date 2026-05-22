@@ -111,10 +111,15 @@ shortcuts.
     `stitched_mosaic.png`. `Run Offline Stitch` can rebuild the mosaic from the
     latest saved metadata after changing `Pixels/pulse`.
 
-The first stitcher uses stage coordinates for deterministic placement. This is
-intentional: it gives a stable baseline before adding more aggressive image
-registration. Each tile is sampled multiple times and the clearest acceptable
-frame is saved, which helps while the temporary setup is still vibration-prone.
+The stitcher starts from stage coordinates, then tries to refine adjacent tile
+placement by matching their overlapping image regions. If the overlap has too
+little texture for reliable matching, it falls back to the stage-coordinate
+placement instead of forcing a bad correction. Each tile is sampled multiple
+times and the clearest acceptable frame is saved, which helps while the
+temporary setup is still vibration-prone.
+
+The `Plane View` tab in the `Image Stitching` panel shows the recorded corner
+points, planned tile locations, and the current tile while scanning.
 
 ## Camera Overexposure
 

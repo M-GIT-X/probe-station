@@ -4,7 +4,11 @@ import unittest
 
 import numpy as np
 
-from image_stitcher import stitch_session_by_metadata, stitch_tiles_by_stage_coordinates
+from image_stitcher import (
+    refine_tile_positions_by_overlap,
+    stitch_session_by_metadata,
+    stitch_tiles_by_stage_coordinates,
+)
 from stitching_store import TileRecord
 
 
@@ -24,6 +28,40 @@ class ImageStitcherTest(unittest.TestCase):
         self.assertEqual(result.shape, (40, 100, 3))
         self.assertEqual(int(result[10, 10, 1]), 100)
         self.assertEqual(int(result[10, 90, 2]), 180)
+
+    def test_overlap_registration_corrects_neighbor_stage_error(self):
+        rng = np.random.default_rng(7)
+        base = rng.integers(0, 255, size=(40, 80, 3), dtype=np.uint8)
+        left = base[:, 0:50].copy()
+        right = base[:, 30:80].copy()
+        tiles = [
+            TileRecord(row=0, col=0, x=0, y=0, z=0, filename="left.png", focus_score=1.0),
+            TileRecord(row=0, col=1, x=35, y=0, z=0, filename="right.png", focus_score=1.0),
+        ]
+
+        positions = refine_tile_positions_by_overlap([left, right], tiles, pixels_per_pulse=1.0, max_correction=10)
+
+        self.assertEqual(positions[0], (0, 0))
+        self.assertEqual(positions[1], (30, 0))
+
+    def test_registered_stitcher_uses_overlap_corrected_positions(self):
+        rng = np.random.default_rng(8)
+        base = rng.integers(0, 255, size=(40, 80, 3), dtype=np.uint8)
+        left = base[:, 0:50].copy()
+        right = base[:, 30:80].copy()
+        tiles = [
+            TileRecord(row=0, col=0, x=0, y=0, z=0, filename="left.png", focus_score=1.0),
+            TileRecord(row=0, col=1, x=35, y=0, z=0, filename="right.png", focus_score=1.0),
+        ]
+
+        result = stitch_tiles_by_stage_coordinates(
+            [left, right],
+            tiles,
+            pixels_per_pulse=1.0,
+            use_overlap_registration=True,
+        )
+
+        self.assertEqual(result.shape, (40, 80, 3))
 
     def test_stitch_session_by_metadata_writes_output_image(self):
         try:
