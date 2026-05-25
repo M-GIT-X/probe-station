@@ -26,6 +26,22 @@ class StitchingViewModelTest(unittest.TestCase):
         self.assertEqual(model.tiles[1].state, "current")
         self.assertEqual(model.tiles[0].state, "done")
 
+    def test_completed_capture_count_keeps_all_saved_tiles_marked_done(self):
+        corners = [
+            SamplePlanePoint("c1", 0, 0, 100),
+            SamplePlanePoint("c2", 100, 0, 100),
+            SamplePlanePoint("c3", 100, 100, 100),
+            SamplePlanePoint("c4", 0, 100, 100),
+        ]
+        tiles = [
+            TilePoint(row=0, col=0, x=0, y=0, z=100),
+            TilePoint(row=0, col=1, x=100, y=0, z=100),
+        ]
+
+        model = build_stitching_view_model(corners, tiles, captured_tile_count=2)
+
+        self.assertEqual([tile.state for tile in model.tiles], ["done", "done"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,9 @@ import numpy as np
 
 from stitching_store import TileRecord
 
+_COARSE_REGISTRATION_MAX_DIMENSION = 128
+_INTERMEDIATE_REGISTRATION_MAX_DIMENSION = 512
+
 
 def stitch_tiles_by_stage_coordinates(
     frames: list[np.ndarray],
@@ -151,15 +154,73 @@ def _estimate_neighbor_delta(
     expected_delta: tuple[int, int],
     max_correction: int,
 ) -> tuple[int, int]:
-    ax, ay = expected_delta
-    best_delta = expected_delta
-    best_score = float("inf")
     anchor_gray = _as_gray_float(anchor_frame)
     moving_gray = _as_gray_float(moving_frame)
-    x_candidates = range(ax - max_correction, ax + max_correction + 1)
-    y_candidates = range(ay - max_correction, ay + max_correction + 1)
+    max_dimension = max(anchor_gray.shape + moving_gray.shape)
+    coarse_scale = min(1.0, _COARSE_REGISTRATION_MAX_DIMENSION / max_dimension)
+    if coarse_scale >= 1.0:
+        return _search_neighbor_delta(
+            anchor_gray,
+            moving_gray,
+            center=expected_delta,
+            radius=max_correction,
+            allowed_center=expected_delta,
+            allowed_radius=max_correction,
+        )
+
+    coarse_anchor = _resize_gray(anchor_gray, coarse_scale)
+    coarse_moving = _resize_gray(moving_gray, coarse_scale)
+    coarse_expected = _scale_delta(expected_delta, coarse_scale)
+    coarse_delta = _search_neighbor_delta(
+        coarse_anchor,
+        coarse_moving,
+        center=coarse_expected,
+        radius=max(1, int(np.ceil(max_correction * coarse_scale))),
+    )
+    estimate = _unscale_delta(coarse_delta, coarse_scale)
+
+    intermediate_scale = min(1.0, _INTERMEDIATE_REGISTRATION_MAX_DIMENSION / max_dimension)
+    if intermediate_scale > coarse_scale and intermediate_scale < 1.0:
+        intermediate_anchor = _resize_gray(anchor_gray, intermediate_scale)
+        intermediate_moving = _resize_gray(moving_gray, intermediate_scale)
+        intermediate_center = _scale_delta(estimate, intermediate_scale)
+        intermediate_delta = _search_neighbor_delta(
+            intermediate_anchor,
+            intermediate_moving,
+            center=intermediate_center,
+            radius=max(2, int(np.ceil(intermediate_scale / coarse_scale)) + 1),
+        )
+        estimate = _unscale_delta(intermediate_delta, intermediate_scale)
+
+    return _search_neighbor_delta(
+        anchor_gray,
+        moving_gray,
+        center=estimate,
+        radius=2,
+        allowed_center=expected_delta,
+        allowed_radius=max_correction,
+    )
+
+
+def _search_neighbor_delta(
+    anchor_gray: np.ndarray,
+    moving_gray: np.ndarray,
+    *,
+    center: tuple[int, int],
+    radius: int,
+    allowed_center: tuple[int, int] | None = None,
+    allowed_radius: int | None = None,
+) -> tuple[int, int]:
+    best_delta = center
+    best_score = float("inf")
+    cx, cy = center
+    x_candidates = range(cx - radius, cx + radius + 1)
+    y_candidates = range(cy - radius, cy + radius + 1)
     for dy in y_candidates:
         for dx in x_candidates:
+            if allowed_center is not None and allowed_radius is not None:
+                if abs(dx - allowed_center[0]) > allowed_radius or abs(dy - allowed_center[1]) > allowed_radius:
+                    continue
             score = _overlap_mse(anchor_gray, moving_gray, dx, dy)
             if score is not None and score < best_score:
                 best_score = score
@@ -185,6 +246,20 @@ def _as_gray_float(frame: np.ndarray) -> np.ndarray:
     if arr.ndim == 3:
         arr = arr.mean(axis=2)
     return arr.astype(np.float32)
+
+
+def _resize_gray(frame: np.ndarray, scale: float) -> np.ndarray:
+    import cv2
+
+    return cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def _scale_delta(delta: tuple[int, int], scale: float) -> tuple[int, int]:
+    return int(round(delta[0] * scale)), int(round(delta[1] * scale))
+
+
+def _unscale_delta(delta: tuple[int, int], scale: float) -> tuple[int, int]:
+    return int(round(delta[0] / scale)), int(round(delta[1] / scale))
 
 
 def _overlap_mse(anchor: np.ndarray, moving: np.ndarray, dx: int, dy: int) -> float | None:

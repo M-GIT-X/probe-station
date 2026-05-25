@@ -28,6 +28,7 @@ def build_stitching_view_model(
     tiles: list[TilePoint],
     *,
     current_tile_index: int | None = None,
+    captured_tile_count: int | None = None,
 ) -> StitchingViewModel:
     xs = [point.x for point in corners] + [tile.x for tile in tiles]
     ys = [point.y for point in corners] + [tile.y for tile in tiles]
@@ -44,11 +45,10 @@ def build_stitching_view_model(
     ]
     tile_points = []
     for index, tile in enumerate(tiles):
-        if current_tile_index is None:
-            state = "pending"
-        elif index < current_tile_index:
+        completed_count = current_tile_index if captured_tile_count is None else captured_tile_count
+        if completed_count is not None and index < completed_count:
             state = "done"
-        elif index == current_tile_index:
+        elif current_tile_index is not None and index == current_tile_index:
             state = "current"
         else:
             state = "pending"

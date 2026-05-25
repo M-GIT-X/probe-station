@@ -6,6 +6,7 @@ from gui_app import (
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
     Mode,
+    PREVIEW_PLACEHOLDER_TEXT,
     VIDEO_PREVIEW_MAX_HEIGHT,
     VIDEO_PREVIEW_MAX_WIDTH,
     mode_panel_spec,
@@ -33,14 +34,16 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertEqual(stitching.visible_sections, ("image_stitching",))
         self.assertIn("Start Autofocus", autofocus.primary_actions)
         self.assertIn("Record Corner", stitching.primary_actions)
+        self.assertNotIn("Run Offline Stitch", stitching.primary_actions)
         self.assertIn("Stitched mosaic", stitching.status_fields)
 
-    def test_window_and_video_defaults_fit_common_small_windows_screen(self):
-        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1120x700")
+    def test_window_and_video_defaults_support_a_larger_primary_preview(self):
+        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1360x900")
         self.assertLessEqual(MIN_WINDOW_WIDTH, 960)
         self.assertLessEqual(MIN_WINDOW_HEIGHT, 620)
-        self.assertLessEqual(VIDEO_PREVIEW_MAX_WIDTH, 420)
-        self.assertLessEqual(VIDEO_PREVIEW_MAX_HEIGHT, 240)
+        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_WIDTH, 640)
+        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_HEIGHT, 400)
+        self.assertIn("CAMERA OFFLINE", PREVIEW_PLACEHOLDER_TEXT)
 
     def test_stitching_geometry_only_asks_operator_for_overlap(self):
         self.assertEqual(stitching_geometry_input_fields(), ("Overlap %",))

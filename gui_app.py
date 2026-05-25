@@ -59,11 +59,13 @@ SAFE_MAX_AUTOFOCUS_RANGE = 2000
 SAFE_MAX_AUTOFOCUS_STEP = 2000
 SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
-DEFAULT_WINDOW_GEOMETRY = "1120x700"
+DEFAULT_WINDOW_GEOMETRY = "1360x900"
 MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
-VIDEO_PREVIEW_MAX_WIDTH = 420
-VIDEO_PREVIEW_MAX_HEIGHT = 240
+VIDEO_PREVIEW_MAX_WIDTH = 640
+VIDEO_PREVIEW_MAX_HEIGHT = 400
+PREVIEW_PLACEHOLDER_TEXT = "CAMERA OFFLINE\nAwaiting optical feed"
+PREVIEW_BACKGROUND_COLOR = "#000000"
 CROSSHAIR_COLOR_RGB = (57, 255, 20)
 
 
@@ -206,7 +208,7 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
     if selected == Mode.IMAGE_STITCHING:
         return ModePanelSpec(
             visible_sections=("image_stitching",),
-            primary_actions=("Record Corner", "Delete Last Corner", "Start Stitching Scan", "Run Offline Stitch"),
+            primary_actions=("Record Corner", "Delete Last Corner", "Start Stitching Scan"),
             status_fields=("Corner count", "Sample plane residual", "Tile progress", "Stitched mosaic"),
             message="Image Stitching: manually focus and record four corners, then scan tiles with Z plane compensation.",
         )
@@ -279,6 +281,7 @@ class StitchingRunState:
     corners: list[SamplePlanePoint] | None = None
     planned_tiles: list[TilePoint] | None = None
     current_tile_index: int | None = None
+    captured_tile_count: int = 0
     calibration: StitchingCalibration | None = None
     last_session_path: Path | None = None
     last_mosaic_path: Path | None = None
@@ -287,6 +290,7 @@ class StitchingRunState:
         self.running = False
         self.stop_requested = False
         self.current_tile_index = None
+        self.captured_tile_count = 0
 
 
 def clamp_autofocus_params(params: AutofocusParams) -> tuple[AutofocusParams, bool]:
@@ -386,6 +390,7 @@ class ProbeStationApp(tk.Tk):
         self.autofocus.reset()
         self.stitching = StitchingRunState(corners=[])
         self._photo = None
+        self._placeholder_photo = None
         self._last_frame_time = 0.0
         self._position_poll_running = False
         self._closing = False
@@ -563,8 +568,18 @@ class ProbeStationApp(tk.Tk):
 
         video_frame = ttk.LabelFrame(center, text="Camera Preview", padding=4)
         video_frame.grid(row=0, column=0, sticky="n", pady=(0, 8))
-        self.video_label = ttk.Label(video_frame, text="No camera", anchor="center", width=58)
+        self.video_label = tk.Label(
+            video_frame,
+            text=PREVIEW_PLACEHOLDER_TEXT,
+            anchor="center",
+            bg=PREVIEW_BACKGROUND_COLOR,
+            fg="#9aa5b1",
+            compound="center",
+            borderwidth=0,
+            highlightthickness=0,
+        )
         self.video_label.grid(row=0, column=0, sticky="nsew")
+        self._show_camera_placeholder()
 
         self.af_plot_frame = ttk.LabelFrame(center, text="Autofocus Curve", padding=4)
         self.af_plot_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -655,9 +670,8 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(stitching, textvariable=self.stitch_plan_var, wraplength=300).grid(row=7, column=0, columnspan=4, sticky="w")
         ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=8, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
         ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=8, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Button(stitching, text="Run Offline Stitch", command=self._run_offline_stitching).grid(row=9, column=0, columnspan=4, sticky="ew", padx=2, pady=2)
-        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=10, column=0, columnspan=4, sticky="w")
-        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=11, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=10, column=0, columnspan=4, sticky="w")
 
         camera_controls = ttk.LabelFrame(right, text="Camera Controls", padding=8)
         camera_controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -815,7 +829,7 @@ class ProbeStationApp(tk.Tk):
             self._record_mission_event("camera_opened", f"index {index} backend {backend}")
         else:
             self.camera_status_var.set("Camera: no-camera mode")
-            self.video_label.configure(text="No camera", image="")
+            self._show_camera_placeholder()
             self._set_status("Camera could not be opened; GUI remains available.")
 
     def _close_camera(self) -> None:
@@ -823,7 +837,7 @@ class ProbeStationApp(tk.Tk):
         self.focus_rois = None
         self.focus_reference_frame = None
         self.camera_status_var.set("Camera: closed")
-        self.video_label.configure(text="No camera", image="")
+        self._show_camera_placeholder()
         self._set_status("Camera closed.")
         self._record_mission_event("camera_closed")
 
@@ -1070,6 +1084,7 @@ class ProbeStationApp(tk.Tk):
         self.stitching.corners = []
         self.stitching.planned_tiles = []
         self.stitching.current_tile_index = None
+        self.stitching.captured_tile_count = 0
         self.stitching.calibration = None
         self.stitch_calibration_var.set("Calibration: pending")
         self.stitch_plan_var.set("Plan: pending")
@@ -1099,11 +1114,11 @@ class ProbeStationApp(tk.Tk):
         width = max(10, canvas.winfo_width() or 320)
         height = max(10, canvas.winfo_height() or 180)
         margin = 18
-        canvas.create_rectangle(0, 0, width, height, fill="#101820", outline="")
+        canvas.create_rectangle(0, 0, width, height, fill="#06110d", outline="")
         corners = self.stitching.corners or []
         tiles = self.stitching.planned_tiles or []
         if not corners and not tiles:
-            canvas.create_text(10, 10, anchor="nw", fill="#e6edf3", text="Record focused corners to preview the scan plane.")
+            canvas.create_text(10, 10, anchor="nw", fill="#7d9d8d", text="Record focused corners to preview the scan plane.")
             return
         display_corners = corners
         if len(corners) >= 3:
@@ -1112,32 +1127,56 @@ class ProbeStationApp(tk.Tk):
                 next(corner for corner in corners if (corner.x, corner.y) == coordinate)
                 for coordinate in boundary
             ]
-        model = build_stitching_view_model(display_corners, tiles, current_tile_index=self.stitching.current_tile_index)
+        model = build_stitching_view_model(
+            display_corners,
+            tiles,
+            current_tile_index=self.stitching.current_tile_index,
+            captured_tile_count=self.stitching.captured_tile_count,
+        )
 
         def xy(point):
             x = margin + point.nx * max(1, width - margin * 2)
             y = margin + point.ny * max(1, height - margin * 2)
             return x, y
 
+        x_spacing = sorted({point.nx for point in model.tiles})
+        y_spacing = sorted({point.ny for point in model.tiles})
+
+        def half_cell(values, span):
+            gaps = [later - earlier for earlier, later in zip(values, values[1:]) if later > earlier]
+            return (min(gaps) * span * 0.52) if gaps else (span * 0.46)
+
+        plot_width = max(1, width - margin * 2)
+        plot_height = max(1, height - margin * 2)
+        half_width = half_cell(x_spacing, plot_width)
+        half_height = half_cell(y_spacing, plot_height)
+        for point in model.tiles:
+            x, y = xy(point)
+            fill = ""
+            if point.state == "done":
+                fill = "#0ea95c"
+            elif point.state == "current":
+                fill = "#39ff88"
+            canvas.create_rectangle(
+                x - half_width,
+                y - half_height,
+                x + half_width,
+                y + half_height,
+                fill=fill,
+                outline="#39ff88",
+                width=1,
+            )
         if len(model.corners) >= 2:
             polygon = []
             for point in model.corners:
                 polygon.extend(xy(point))
-            canvas.create_line(*polygon, fill="#f0c808", width=2)
             if len(model.corners) >= 3:
-                canvas.create_line(*xy(model.corners[-1]), *xy(model.corners[0]), fill="#f0c808", width=2)
-        for point in model.tiles:
-            x, y = xy(point)
-            fill = "#2f81f7"
-            if point.state == "done":
-                fill = "#2ea043"
-            elif point.state == "current":
-                fill = "#ff7b72"
-            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=fill, outline="")
+                polygon.extend(xy(model.corners[0]))
+            canvas.create_line(*polygon, fill="#5bffa0", width=1)
         for point in model.corners:
             x, y = xy(point)
-            canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ffd33d", outline="#ffffff")
-            canvas.create_text(x + 7, y - 7, anchor="w", fill="#e6edf3", text=f"{point.label} z={point.z}")
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#06110d", outline="#5bffa0")
+            canvas.create_text(x + 7, y - 7, anchor="w", fill="#b6fbd2", text=f"{point.label} z={point.z}")
 
     def _read_stitching_params(self) -> tuple[float, int, float, int, Path]:
         try:
@@ -1193,6 +1232,7 @@ class ProbeStationApp(tk.Tk):
         self.stitching.stop_requested = False
         self.stitching.planned_tiles = []
         self.stitching.current_tile_index = None
+        self.stitching.captured_tile_count = 0
         self.stitching.calibration = None
         self._draw_stitching_plane_view()
         self._set_manual_controls_enabled(False)
@@ -1305,6 +1345,7 @@ class ProbeStationApp(tk.Tk):
                 )
                 saved = store.save_tile(frame, record)
                 saved_tiles.append(saved)
+                self.device_queue.put(("stitch_tile_saved", index))
                 self.device_queue.put(("stitch_status", f"Progress: saved tile {index}/{len(tiles)}"))
             store.write_metadata(
                 corners=corners,
@@ -1320,6 +1361,7 @@ class ProbeStationApp(tk.Tk):
                 plane=plane,
                 calibration=calibration,
             )
+            self.device_queue.put(("stitch_status", "Progress: assembling stitched mosaic..."))
             mosaic_path = stitch_session_by_metadata(store.path)
             self.device_queue.put(("stitch_done", (store.path, mosaic_path)))
         except InterruptedError:
@@ -1377,24 +1419,6 @@ class ProbeStationApp(tk.Tk):
         if best_frame is None:
             raise RuntimeError("no valid camera frame captured for stitching")
         return best_frame, best_score
-
-    def _run_offline_stitching(self) -> None:
-        session_path = self.stitching.last_session_path
-        if session_path is None:
-            text = self.stitch_output_var.get().replace("Output:", "").strip()
-            if text and text != "--":
-                session_path = Path(text)
-        if session_path is None or not (session_path / "metadata.json").exists():
-            self._set_status("No stitching session metadata is available yet.")
-            return
-        try:
-            mosaic_path = stitch_session_by_metadata(session_path)
-        except Exception as exc:
-            self._set_status(f"Offline stitch failed: {exc}")
-            return
-        self.stitching.last_mosaic_path = mosaic_path
-        self.stitch_output_var.set(f"Output: {mosaic_path}")
-        self._set_status(f"Offline stitched mosaic saved: {mosaic_path}")
 
     def _sleep_with_stitching_stop(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
@@ -1745,6 +1769,7 @@ class ProbeStationApp(tk.Tk):
                 LOG.exception("camera loop error")
                 self.camera_status_var.set("Camera: read error, no-camera mode")
                 self.camera.close()
+                self._show_camera_placeholder("CAMERA FEED LOST\nCheck camera connection")
         self._schedule_after(60, self._camera_loop)
 
     def _update_focus(self, focus_index: float) -> None:
@@ -1775,6 +1800,7 @@ class ProbeStationApp(tk.Tk):
         except ImportError:
             self.camera_status_var.set("Camera: OpenCV is not installed")
             self.camera.close()
+            self._show_camera_placeholder("CAMERA UNAVAILABLE\nOpenCV is not installed")
             return
 
         now = time.monotonic()
@@ -1794,6 +1820,14 @@ class ProbeStationApp(tk.Tk):
         ppm = header + np.ascontiguousarray(resized).tobytes()
         self._photo = tk.PhotoImage(data=ppm, format="PPM")
         self.video_label.configure(image=self._photo, text="")
+
+    def _show_camera_placeholder(self, text: str = PREVIEW_PLACEHOLDER_TEXT) -> None:
+        self._placeholder_photo = tk.PhotoImage(width=VIDEO_PREVIEW_MAX_WIDTH, height=VIDEO_PREVIEW_MAX_HEIGHT)
+        self._placeholder_photo.put(
+            PREVIEW_BACKGROUND_COLOR,
+            to=(0, 0, VIDEO_PREVIEW_MAX_WIDTH, VIDEO_PREVIEW_MAX_HEIGHT),
+        )
+        self.video_label.configure(image=self._placeholder_photo, text=text, compound="center")
 
     def _drain_device_queue(self) -> None:
         if self._closing:
@@ -1871,6 +1905,7 @@ class ProbeStationApp(tk.Tk):
                     self.stitching.calibration = calibration
                     self.stitching.planned_tiles = plan.tiles
                     self.stitching.current_tile_index = None
+                    self.stitching.captured_tile_count = 0
                     self.stitch_calibration_var.set(
                         "Calibration: "
                         f"X={calibration.x_pixels_per_pulse:.4f} px/pulse  "
@@ -1885,6 +1920,9 @@ class ProbeStationApp(tk.Tk):
                 elif kind == "stitch_tile_index":
                     self.stitching.current_tile_index = int(payload)
                     self._draw_stitching_plane_view()
+                elif kind == "stitch_tile_saved":
+                    self.stitching.captured_tile_count = int(payload)
+                    self._draw_stitching_plane_view()
                 elif kind == "stitch_output":
                     self.stitch_output_var.set(str(payload))
                 elif kind == "stitch_done":
@@ -1897,10 +1935,15 @@ class ProbeStationApp(tk.Tk):
                         self.stitching.last_session_path = Path(session_path)
                     if mosaic_path is not None:
                         self.stitching.current_tile_index = None
+                        self.stitching.captured_tile_count = len(self.stitching.planned_tiles or [])
                         self.stitching.last_mosaic_path = Path(mosaic_path)
                         self.stitch_output_var.set(f"Output: {mosaic_path}")
                         self.stitch_progress_var.set("Progress: completed")
                         self._set_status(f"Image stitching completed: {mosaic_path}")
+                        messagebox.showinfo(
+                            "Image Stitching Completed",
+                            f"扫描完成，大图已自动保存：\n{mosaic_path}",
+                        )
                     else:
                         self.stitching.current_tile_index = None
                         self.stitch_progress_var.set("Progress: stopped")

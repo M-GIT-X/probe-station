@@ -4,6 +4,7 @@ import unittest
 
 import numpy as np
 
+import image_stitcher
 from image_stitcher import (
     refine_tile_positions_by_overlap,
     stitch_session_by_metadata,
@@ -62,6 +63,53 @@ class ImageStitcherTest(unittest.TestCase):
         )
 
         self.assertEqual(result.shape, (40, 80, 3))
+
+    def test_overlap_registration_limits_full_search_work_for_camera_sized_frames(self):
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV is not installed")
+
+        calls = []
+        original_overlap_mse = image_stitcher._overlap_mse
+
+        def counted_overlap_mse(anchor, moving, dx, dy):
+            calls.append((dx, dy))
+            return float((dx - 90) ** 2 + dy**2)
+
+        try:
+            image_stitcher._overlap_mse = counted_overlap_mse
+            frame = np.zeros((240, 320, 3), dtype=np.uint8)
+            image_stitcher._estimate_neighbor_delta(
+                frame,
+                frame,
+                expected_delta=(90, 0),
+                max_correction=30,
+            )
+        finally:
+            image_stitcher._overlap_mse = original_overlap_mse
+
+        self.assertLess(len(calls), 1000)
+
+    def test_multiscale_overlap_registration_preserves_large_frame_alignment_accuracy(self):
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV is not installed")
+
+        rng = np.random.default_rng(17)
+        base = rng.integers(0, 255, size=(480, 1000, 3), dtype=np.uint8)
+        left = base[:, 0:640].copy()
+        right = base[:, 300:940].copy()
+
+        delta = image_stitcher._estimate_neighbor_delta(
+            left,
+            right,
+            expected_delta=(315, 0),
+            max_correction=60,
+        )
+
+        self.assertEqual(delta, (300, 0))
 
     def test_signed_axis_calibration_places_tiles_in_camera_orientation(self):
         left = np.zeros((20, 30, 3), dtype=np.uint8)

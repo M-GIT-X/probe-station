@@ -107,9 +107,9 @@ shortcuts.
    the snake path. Trial images are not saved as tile files.
 10. The GUI saves tile images and `metadata.json` in a new timestamped session
     folder under `stitching_output/`. Metadata includes automatic calibration.
-11. The scan automatically runs offline stitching and writes
-    `stitched_mosaic.png`. `Run Offline Stitch` can rebuild the mosaic from the
-    latest saved metadata and stored calibration.
+11. The scan automatically stitches the captured tiles, writes
+    `stitched_mosaic.png`, and displays a completion notification with its
+    saved path.
 
 The stitcher starts from stage coordinates, then tries to refine adjacent tile
 placement by matching their overlapping image regions. If the overlap has too
@@ -118,8 +118,8 @@ placement instead of forcing a bad correction. Each tile is sampled multiple
 times and the clearest acceptable frame is saved, which helps while the
 temporary setup is still vibration-prone.
 
-The dynamic display below the shared camera preview shows recorded corner
-points, planned tile locations, and the current tile while scanning.
+The dynamic display below the shared camera preview outlines the planned scan
+grid in green and fills each captured tile area as scanning progresses.
 
 ## Camera Overexposure
 
