@@ -38,7 +38,6 @@ APP_TITLE = "Three-Axis Probe Station"
 
 class Mode(Enum):
     MANUAL = "Manual Mode"
-    FOCUS_ASSIST = "Manual Focus Assist"
     AUTO_FOCUS = "Auto Focus"
     IMAGE_STITCHING = "Image Stitching"
 
@@ -110,10 +109,6 @@ def selected_serial_port_is_listed(port: str) -> bool:
     return port.upper() in detected
 
 
-def app_stage_title(enable_focus_assist: bool, enable_autofocus: bool) -> str:
-    return APP_TITLE
-
-
 def should_ignore_axis_shortcut(widget) -> bool:
     if widget is None:
         return False
@@ -136,9 +131,6 @@ def mission_log_message_for_event(kind: str, payload: object = None) -> str | No
         "motor_disconnected": "STAGE OFFLINE. Motion channel secured.",
         "camera_opened": f"CAMERA ONLINE. Optical feed established: {text}.",
         "camera_closed": "CAMERA OFFLINE. Optical feed secured.",
-        "focus_assist_started": "FOCUS ASSIST ARMED. Manual Z sweep may proceed.",
-        "focus_assist_stopped": "FOCUS ASSIST STANDBY. Manual focus recording halted.",
-        "best_focus_reset": "FOCUS REFERENCE RESET. Previous best-focus record cleared.",
         "autofocus_started": "AUTOFOCUS SEQUENCE START. Z-axis scan authorized.",
         "autofocus_completed": "AUTOFOCUS COMPLETE. Final focus position confirmed.",
         "autofocus_stopped": "AUTOFOCUS HOLD. Stop command acknowledged.",
@@ -193,23 +185,16 @@ class ModePanelSpec:
 
 def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
     selected = mode if isinstance(mode, Mode) else Mode(str(mode))
-    if selected == Mode.FOCUS_ASSIST:
-        return ModePanelSpec(
-            visible_sections=("manual", "focus_assist"),
-            primary_actions=("Start Manual Focus Assist", "Stop Manual Focus Assist", "Reset Best Focus", "Go To Best Z"),
-            status_fields=("Current focus index", "Best focus index", "Best Z", "Focus curve"),
-            message="Manual Focus Assist: move Z manually; the GUI records best focus and best Z.",
-        )
     if selected == Mode.AUTO_FOCUS:
         return ModePanelSpec(
-            visible_sections=("manual", "autofocus"),
+            visible_sections=("autofocus",),
             primary_actions=("Start Autofocus", "Stop Autofocus"),
             status_fields=("AF status", "Current offset", "Best score", "Final offset", "Focus curve"),
             message="Auto Focus: Start Autofocus runs a conservative Z-only scan; manual movement returns when AF is stopped or complete.",
         )
     if selected == Mode.IMAGE_STITCHING:
         return ModePanelSpec(
-            visible_sections=("manual", "image_stitching"),
+            visible_sections=("image_stitching",),
             primary_actions=("Record Corner", "Delete Last Corner", "Start Stitching Scan", "Run Offline Stitch"),
             status_fields=("Corner count", "Sample plane residual", "Tile progress", "Stitched mosaic"),
             message="Image Stitching: manually focus and record four corners, then scan tiles with Z plane compensation.",
@@ -220,11 +205,6 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
         status_fields=("Absolute position", "Relative position", "Live focus index"),
         message="Manual Mode: manual X/Y/Z control only; no recording and no automatic movement.",
     )
-
-
-def mode_status_label_row() -> int:
-    return len(Mode)
-
 
 @dataclass(frozen=True)
 class AutofocusParams:
@@ -361,50 +341,15 @@ def _interquartile_range(values: list[float]) -> float:
     return float(q75 - q25)
 
 
-@dataclass
-class ManualFocusAssistState:
-    recording: bool = False
-    best_focus_index: float | None = None
-    best_z_abs: int | None = None
-    best_z_rel: int | None = None
-    best_timestamp: float | None = None
-
-    def reset_best(self, keep_recording: bool) -> None:
-        self.recording = keep_recording
-        self.best_focus_index = None
-        self.best_z_abs = None
-        self.best_z_rel = None
-        self.best_timestamp = None
-
-    def record_sample(self, focus_index: float, z_abs: int, z_rel: int, timestamp: float | None = None) -> bool:
-        if not self.recording:
-            return False
-        if timestamp is None:
-            timestamp = time.time()
-        if self.best_focus_index is None or self._is_meaningful_improvement(focus_index):
-            self.best_focus_index = float(focus_index)
-            self.best_z_abs = int(z_abs)
-            self.best_z_rel = int(z_rel)
-            self.best_timestamp = float(timestamp)
-            return True
-        return False
-
-    def _is_meaningful_improvement(self, focus_index: float) -> bool:
-        if self.best_focus_index is None:
-            return True
-        return focus_index > self.best_focus_index * 1.01 or focus_index > self.best_focus_index + 0.5
-
-
 class ProbeStationApp(tk.Tk):
-    def __init__(self, enable_focus_assist: bool = True, enable_autofocus: bool = True) -> None:
+    def __init__(self, enable_autofocus: bool = True) -> None:
         super().__init__()
         self.app_stage_title = APP_TITLE
         self.title(APP_TITLE)
         self.geometry(DEFAULT_WINDOW_GEOMETRY)
         self.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
-        self.enable_focus_assist = True
-        self.enable_autofocus = True
+        self.enable_autofocus = enable_autofocus
         self.controller: StageController | None = None
         self.camera = OpenCVCamera()
         self.camera_lock = threading.Lock()
@@ -413,8 +358,6 @@ class ProbeStationApp(tk.Tk):
         self.absolute_pos = {"X": 0, "Y": 0, "Z": 0}
         self.position_available = {"X": False, "Y": False, "Z": False}
         self.software_origin = {"X": 0, "Y": 0, "Z": 0}
-        self.focus_history: list[float] = []
-        self.focus_z_history: list[int] = []
         self.focus_rois = None
         self.focus_reference_frame = None
         self.last_focus_info = {
@@ -423,7 +366,6 @@ class ProbeStationApp(tk.Tk):
             "underexposed_fraction": 0.0,
             "overexposed": False,
         }
-        self.manual_focus_assist = ManualFocusAssistState()
         self.autofocus = AutofocusRunState()
         self.autofocus.reset()
         self.stitching = StitchingRunState(corners=[])
@@ -472,32 +414,20 @@ class ProbeStationApp(tk.Tk):
         super().destroy()
 
     def _build_ui(self) -> None:
-        self.columnconfigure(0, weight=0)
-        self.columnconfigure(1, weight=1)
-        self.columnconfigure(2, weight=0)
-        self.rowconfigure(0, weight=1)
-
-        left = ttk.Frame(self, padding=10)
-        left.grid(row=0, column=0, sticky="ns")
-        middle = ttk.Frame(self, padding=(0, 10, 10, 10))
-        middle.grid(row=0, column=1, sticky="nsew")
-        right = ttk.Frame(self, padding=(0, 10, 10, 10))
-        right.grid(row=0, column=2, sticky="ne")
-        middle.columnconfigure(0, weight=1)
-        right.columnconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
         self.port_var = tk.StringVar(value=default_serial_port())
         self.camera_index_var = tk.StringVar(value="0")
         self.camera_backend_var = tk.StringVar(value="DSHOW")
         self.mode_var = tk.StringVar(value=Mode.MANUAL.value)
         self.current_mode_var = tk.StringVar(value=f"Current mode: {Mode.MANUAL.value}")
-        self.mode_message_var = tk.StringVar(value="Manual Mode: manual X/Y/Z control only; no recording and no automatic movement.")
         self.step_var = tk.StringVar(value="10")
         self.speed_var = tk.StringVar(value="2")
         self.status_var = tk.StringVar(value=f"{APP_TITLE}. Ready. 软件急停不能替代物理急停。")
         self.motor_status_var = tk.StringVar(value="Motor: disconnected")
         self.camera_status_var = tk.StringVar(value="Camera: not opened")
-        self.focus_var = tk.StringVar(value="Focus index: 0.00")
+        self.focus_var = tk.StringVar(value="Sharpness index: 0.00")
         self.brightness_var = tk.StringVar(value="Brightness mean: --")
         self.saturation_var = tk.StringVar(value="Saturation fraction: --")
         self.underexposed_var = tk.StringVar(value="Underexposed fraction: --")
@@ -510,14 +440,6 @@ class ProbeStationApp(tk.Tk):
         self.contrast_var = tk.StringVar(value="")
         self.wb_temperature_var = tk.StringVar(value="")
         self.camera_properties_var = tk.StringVar(value="Camera properties: --")
-        self.current_z_abs_var = tk.StringVar(value="Current Z absolute: waiting")
-        self.current_z_rel_var = tk.StringVar(value="Current Z relative: waiting")
-        self.best_focus_var = tk.StringVar(value="Best focus index: --")
-        self.best_z_abs_var = tk.StringVar(value="Best Z absolute: --")
-        self.best_z_rel_var = tk.StringVar(value="Best Z relative: --")
-        self.best_focus_time_var = tk.StringVar(value="Best focus time: --")
-        self.focus_recording_var = tk.StringVar(value="Recording: no")
-        self.focus_assist_message_var = tk.StringVar(value="Open the camera, then start manual focus assist.")
         self.af_scan_range_var = tk.StringVar(value="20")
         self.af_scan_step_var = tk.StringVar(value="5")
         self.af_speed_var = tk.StringVar(value="2")
@@ -550,57 +472,60 @@ class ProbeStationApp(tk.Tk):
         self.recent_feedback_var = tk.StringVar(value="Recent feedback: --")
         self.recent_error_var = tk.StringVar(value="Recent error: --")
         self.running_state_var = tk.StringVar(value="Running state: idle")
-        self.debug_log_var = tk.StringVar(value=f"debug.log: {Path(__file__).with_name('debug.log')}")
+
+        top = ttk.Frame(self, padding=(10, 10, 10, 6))
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(3, weight=1)
+        ttk.Label(top, text=APP_TITLE, font=("", 14, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 24))
+        ttk.Label(top, text="Mode").grid(row=0, column=1, sticky="w")
+        self.mode_combo = ttk.Combobox(top, textvariable=self.mode_var, values=[mode.value for mode in Mode], state="readonly", width=22)
+        self.mode_combo.grid(row=0, column=2, sticky="w", padx=(6, 18))
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_mode_change())
+        ttk.Label(top, textvariable=self.current_mode_var, foreground="#005a8d").grid(row=0, column=3, sticky="w")
+        ttk.Label(top, textvariable=self.running_state_var).grid(row=0, column=4, sticky="e")
+
+        body = ttk.Frame(self, padding=(10, 0, 10, 10))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1, minsize=430)
+        body.rowconfigure(0, weight=1)
+        left = ttk.Frame(body, padding=(0, 0, 10, 0))
+        left.grid(row=0, column=0, sticky="ns")
+        center = ttk.Frame(body)
+        center.grid(row=0, column=1, sticky="nsew")
+        center.columnconfigure(0, weight=1)
+        center.rowconfigure(4, weight=1)
+        right = ttk.Frame(body, padding=(10, 0, 0, 0))
+        right.grid(row=0, column=2, sticky="ns")
+        right.columnconfigure(0, weight=1)
 
         conn = ttk.LabelFrame(left, text="Devices", padding=8)
         conn.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         conn.columnconfigure(1, weight=1)
         ttk.Label(conn, text="Serial").grid(row=0, column=0, sticky="w")
-        self.port_combo = ttk.Combobox(
-            conn,
-            textvariable=self.port_var,
-            values=serial_port_choices(),
-            width=12,
-        )
+        self.port_combo = ttk.Combobox(conn, textvariable=self.port_var, values=serial_port_choices(), width=11)
         self.port_combo.grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(conn, text="Connect Stage", command=self._connect_motor).grid(row=0, column=2, padx=2)
-        ttk.Button(conn, text="Disconnect Stage", command=self._disconnect_motor).grid(row=0, column=3, padx=2)
-        ttk.Label(conn, text="Camera").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(conn, textvariable=self.camera_index_var, width=12).grid(row=1, column=1, sticky="ew", padx=4, pady=(6, 0))
-        ttk.Combobox(conn, textvariable=self.camera_backend_var, values=["DSHOW", "MSMF", "ANY"], width=8, state="readonly").grid(
-            row=1, column=2, sticky="ew", padx=2, pady=(6, 0)
+        ttk.Button(conn, text="Connect", command=self._connect_motor).grid(row=0, column=2, padx=2)
+        ttk.Button(conn, text="Disconnect", command=self._disconnect_motor).grid(row=1, column=2, padx=2, pady=(5, 0))
+        ttk.Button(conn, text="Refresh Ports", command=self._refresh_serial_ports).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Label(conn, text="Camera").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(conn, textvariable=self.camera_index_var, width=6).grid(row=2, column=1, sticky="ew", padx=4, pady=(8, 0))
+        ttk.Combobox(conn, textvariable=self.camera_backend_var, values=["DSHOW", "MSMF", "ANY"], width=7, state="readonly").grid(
+            row=3, column=0, sticky="ew", pady=(5, 0)
         )
-        ttk.Button(conn, text="Open Camera / Switch Camera", command=self._open_camera).grid(row=1, column=3, padx=2, pady=(6, 0))
-        ttk.Button(conn, text="Refresh Ports", command=self._refresh_serial_ports).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(conn, text="Close Camera", command=self._close_camera).grid(row=2, column=2, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(conn, textvariable=self.motor_status_var).grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ttk.Label(conn, textvariable=self.camera_status_var).grid(row=4, column=0, columnspan=4, sticky="w")
+        ttk.Button(conn, text="Open Camera", command=self._open_camera).grid(row=3, column=1, sticky="ew", padx=4, pady=(5, 0))
+        ttk.Button(conn, text="Close", command=self._close_camera).grid(row=3, column=2, sticky="ew", pady=(5, 0))
+        ttk.Label(conn, textvariable=self.motor_status_var, wraplength=270).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(conn, textvariable=self.camera_status_var, wraplength=270).grid(row=5, column=0, columnspan=3, sticky="w")
 
-        modes = ttk.LabelFrame(left, text="Mode Selector", padding=8)
-        modes.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        modes.columnconfigure(0, weight=1)
-        for row, mode in enumerate(Mode):
-            ttk.Radiobutton(
-                modes,
-                text=mode.value,
-                value=mode.value,
-                variable=self.mode_var,
-                command=self._on_mode_change,
-            ).grid(row=row, column=0, sticky="w")
-        ttk.Label(modes, textvariable=self.current_mode_var, foreground="#005a8d").grid(
-            row=mode_status_label_row(), column=0, sticky="w", pady=(6, 0)
-        )
-
-        self.manual_panel = ttk.LabelFrame(left, text="Manual Move", padding=8)
+        self.manual_panel = ttk.LabelFrame(left, text="Motion Control", padding=8)
         move = self.manual_panel
-        move.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        move.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         for col in range(3):
             move.columnconfigure(col, weight=1)
-        ttk.Label(move, text="Step pulses (<=2000)").grid(row=0, column=0, sticky="w")
+        ttk.Label(move, text="Step pulses").grid(row=0, column=0, sticky="w")
         ttk.Entry(move, textvariable=self.step_var, width=8).grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Label(move, text="Speed %").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(move, textvariable=self.speed_var, width=8).grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
-
         self.manual_move_buttons = [
             ttk.Button(move, text="Y+  W", command=lambda: self._move("Y", +1)),
             ttk.Button(move, text="X-  A", command=lambda: self._move("X", -1)),
@@ -617,190 +542,124 @@ class ProbeStationApp(tk.Tk):
         self.manual_move_buttons[4].grid(row=5, column=0, sticky="ew", padx=2, pady=(10, 2))
         self.manual_move_buttons[5].grid(row=5, column=2, sticky="ew", padx=2, pady=(10, 2))
         ttk.Button(move, text="Software Emergency Stop  Esc", command=self._emergency_stop).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
-        self.software_origin_button = ttk.Button(
-            move,
-            text="Set Current As Software Origin",
-            command=self._set_software_origin,
-        )
+        self.software_origin_button = ttk.Button(move, text="Set Software Origin", command=self._set_software_origin)
+        self.software_origin_button.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
-        pos = ttk.LabelFrame(middle, text="Position / Status", padding=8)
-        pos.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(pos, textvariable=self.abs_pos_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(pos, textvariable=self.rel_pos_var).grid(row=1, column=0, sticky="w")
-        ttk.Label(pos, textvariable=self.recent_command_var).grid(row=2, column=0, sticky="w")
-        ttk.Label(pos, textvariable=self.recent_feedback_var).grid(row=3, column=0, sticky="w")
-        ttk.Label(pos, textvariable=self.recent_error_var).grid(row=4, column=0, sticky="w")
-        ttk.Label(pos, textvariable=self.running_state_var).grid(row=5, column=0, sticky="w")
-        ttk.Label(pos, textvariable=self.debug_log_var, wraplength=310).grid(row=6, column=0, sticky="w")
+        video_frame = ttk.LabelFrame(center, text="Camera Preview", padding=4)
+        video_frame.grid(row=0, column=0, sticky="n", pady=(0, 8))
+        self.video_label = ttk.Label(video_frame, text="No camera", anchor="center", width=58)
+        self.video_label.grid(row=0, column=0, sticky="nsew")
 
-        mission = ttk.LabelFrame(middle, text="Mission Log", padding=8)
-        mission.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.af_plot_frame = ttk.LabelFrame(center, text="Autofocus Curve", padding=4)
+        self.af_plot_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.af_canvas = tk.Canvas(self.af_plot_frame, height=120, bg="#101820", highlightthickness=0)
+        self.af_canvas.grid(row=0, column=0, sticky="ew")
+        self.af_plot_frame.columnconfigure(0, weight=1)
+
+        self.stitch_plot_frame = ttk.LabelFrame(center, text="Stitching Plane / Progress", padding=4)
+        self.stitch_plot_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.stitch_plane_canvas = tk.Canvas(self.stitch_plot_frame, height=160, bg="#101820", highlightthickness=0)
+        self.stitch_plane_canvas.grid(row=0, column=0, sticky="ew")
+        self.stitch_plot_frame.columnconfigure(0, weight=1)
+        self._draw_stitching_plane_view()
+
+        focus_info = ttk.LabelFrame(center, text="Sharpness / Image Status", padding=8)
+        focus_info.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for col in range(2):
+            focus_info.columnconfigure(col, weight=1)
+        for index, variable in enumerate(
+            [self.focus_var, self.brightness_var, self.saturation_var, self.underexposed_var, self.exposure_warning_var]
+        ):
+            ttk.Label(focus_info, textvariable=variable).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 10))
+
+        pos = ttk.LabelFrame(center, text="Position / Activity", padding=8)
+        pos.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        for row, variable in enumerate(
+            [self.abs_pos_var, self.rel_pos_var, self.recent_command_var, self.recent_feedback_var, self.recent_error_var]
+        ):
+            ttk.Label(pos, textvariable=variable).grid(row=row, column=0, sticky="w")
+
+        mission = ttk.LabelFrame(center, text="Mission Log", padding=8)
+        mission.grid(row=4, column=0, sticky="nsew")
         mission.columnconfigure(0, weight=1)
-        self.mission_log_text = tk.Text(mission, height=7, width=42, wrap="word", state="disabled")
-        self.mission_log_text.grid(row=0, column=0, sticky="ew")
+        self.mission_log_text = tk.Text(mission, height=5, width=54, wrap="word", state="disabled")
+        self.mission_log_text.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(mission, textvariable=self.status_var, wraplength=500, foreground="#8a4b00").grid(row=1, column=0, sticky="ew", pady=(6, 0))
         self._append_mission_log("SYSTEM READY. Awaiting operator command.")
 
-        if self.enable_focus_assist:
-            self.focus_panel = ttk.LabelFrame(middle, text="手动辅助对焦 Manual Focus Assist", padding=8)
-            focus = self.focus_panel
-            focus.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-            focus.columnconfigure(0, weight=1)
-            focus.columnconfigure(1, weight=1)
-            ttk.Label(focus, textvariable=self.focus_assist_message_var, wraplength=300).grid(row=0, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.focus_var).grid(row=1, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.current_z_abs_var).grid(row=2, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.current_z_rel_var).grid(row=3, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.best_focus_var).grid(row=4, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.best_z_abs_var).grid(row=5, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.best_z_rel_var).grid(row=6, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.best_focus_time_var).grid(row=7, column=0, columnspan=2, sticky="w")
-            ttk.Label(focus, textvariable=self.focus_recording_var).grid(row=8, column=0, columnspan=2, sticky="w")
-            ttk.Button(focus, text="Start Manual Focus Assist", command=self._start_focus_assist).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 2))
-            ttk.Button(focus, text="Stop Manual Focus Assist", command=self._stop_focus_assist).grid(row=10, column=0, columnspan=2, sticky="ew", pady=2)
-            ttk.Button(focus, text="Go To Best Z", command=self._go_to_best_z).grid(row=11, column=0, sticky="ew", pady=2, padx=(0, 2))
-            ttk.Button(focus, text="Reset Best Focus", command=self._reset_best_focus).grid(row=11, column=1, sticky="ew", pady=2, padx=(2, 0))
-            self.curve_canvas = tk.Canvas(focus, width=280, height=90, bg="#101820", highlightthickness=0)
-            self.curve_canvas.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        else:
-            self.curve_canvas = None
-
         if self.enable_autofocus:
-            self.autofocus_panel = ttk.LabelFrame(middle, text="Conservative Full Scan Autofocus / 保守 Z 轴自动对焦", padding=8)
+            self.autofocus_panel = ttk.LabelFrame(right, text="Auto Focus Controls", padding=8)
             autofocus = self.autofocus_panel
-            autofocus.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+            autofocus.grid(row=0, column=0, sticky="ew", pady=(0, 8))
             for col in range(4):
                 autofocus.columnconfigure(col, weight=1)
-            ttk.Radiobutton(
-                autofocus,
-                text="Semi Auto",
-                value=AutofocusMode.SEMI.value,
-                variable=self.af_mode_var,
-                command=self._on_autofocus_mode_change,
-            ).grid(row=0, column=0, columnspan=2, sticky="w")
-            ttk.Radiobutton(
-                autofocus,
-                text="Full Auto",
-                value=AutofocusMode.FULL.value,
-                variable=self.af_mode_var,
-                command=self._on_autofocus_mode_change,
-            ).grid(row=0, column=2, columnspan=2, sticky="w")
-            ttk.Label(autofocus, text="Half-range").grid(row=1, column=0, sticky="w")
-            self.af_range_entry = ttk.Entry(autofocus, textvariable=self.af_scan_range_var, width=7)
-            self.af_range_entry.grid(row=1, column=1, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Step").grid(row=1, column=2, sticky="w")
-            self.af_step_entry = ttk.Entry(autofocus, textvariable=self.af_scan_step_var, width=7)
-            self.af_step_entry.grid(row=1, column=3, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Speed %").grid(row=2, column=0, sticky="w")
-            self.af_speed_entry = ttk.Entry(autofocus, textvariable=self.af_speed_var, width=7)
-            self.af_speed_entry.grid(row=2, column=1, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Settle s").grid(row=2, column=2, sticky="w")
-            self.af_settle_entry = ttk.Entry(autofocus, textvariable=self.af_settle_seconds_var, width=7)
-            self.af_settle_entry.grid(row=2, column=3, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Sample s").grid(row=3, column=0, sticky="w")
-            self.af_sample_entry = ttk.Entry(autofocus, textvariable=self.af_sample_seconds_var, width=7)
-            self.af_sample_entry.grid(row=3, column=1, sticky="ew", padx=2)
-            ttk.Label(autofocus, text="Near best").grid(row=3, column=2, sticky="w")
-            self.af_near_best_entry = ttk.Entry(autofocus, textvariable=self.af_near_best_ratio_var, width=7)
-            self.af_near_best_entry.grid(row=3, column=3, sticky="ew", padx=2)
+            ttk.Radiobutton(autofocus, text="Semi Auto", value=AutofocusMode.SEMI.value, variable=self.af_mode_var, command=self._on_autofocus_mode_change).grid(row=0, column=0, columnspan=2, sticky="w")
+            ttk.Radiobutton(autofocus, text="Full Auto", value=AutofocusMode.FULL.value, variable=self.af_mode_var, command=self._on_autofocus_mode_change).grid(row=0, column=2, columnspan=2, sticky="w")
+            fields = [
+                ("Half-range", self.af_scan_range_var, "af_range_entry"),
+                ("Step", self.af_scan_step_var, "af_step_entry"),
+                ("Speed %", self.af_speed_var, "af_speed_entry"),
+                ("Settle s", self.af_settle_seconds_var, "af_settle_entry"),
+                ("Sample s", self.af_sample_seconds_var, "af_sample_entry"),
+                ("Near best", self.af_near_best_ratio_var, "af_near_best_entry"),
+            ]
+            for index, (label, variable, name) in enumerate(fields):
+                row, col = 1 + index // 2, (index % 2) * 2
+                ttk.Label(autofocus, text=label).grid(row=row, column=col, sticky="w")
+                entry = ttk.Entry(autofocus, textvariable=variable, width=7)
+                entry.grid(row=row, column=col + 1, sticky="ew", padx=2)
+                setattr(self, name, entry)
             ttk.Button(autofocus, text="Start Autofocus", command=self._start_autofocus).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 2), padx=(0, 2))
             ttk.Button(autofocus, text="Stop Autofocus", command=self._stop_autofocus).grid(row=4, column=2, columnspan=2, sticky="ew", pady=(8, 2), padx=(2, 0))
-            labels = [
-                self.af_status_var,
-                self.af_offset_var,
-                self.af_score_var,
-                self.af_best_var,
-                self.af_best_offset_var,
-                self.af_final_offset_var,
-                self.af_confirm_score_var,
-                self.af_sample_count_var,
-            ]
-            for index, variable in enumerate(labels, start=5):
-                ttk.Label(autofocus, textvariable=variable).grid(row=index, column=0, columnspan=4, sticky="w")
-            self.af_canvas = tk.Canvas(autofocus, width=280, height=120, bg="#101820", highlightthickness=0)
-            self.af_canvas.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-            self._on_autofocus_mode_change()
-        else:
-            self.af_canvas = None
+            for index, variable in enumerate(
+                [self.af_status_var, self.af_offset_var, self.af_score_var, self.af_best_var, self.af_best_offset_var, self.af_final_offset_var, self.af_confirm_score_var, self.af_sample_count_var],
+                start=5,
+            ):
+                ttk.Label(autofocus, textvariable=variable, wraplength=300).grid(row=index, column=0, columnspan=4, sticky="w")
 
-        self.stitching_panel = ttk.LabelFrame(middle, text="Image Stitching / 四角拼场", padding=8)
+        self.stitching_panel = ttk.LabelFrame(right, text="Image Stitching Controls", padding=8)
         stitching = self.stitching_panel
-        stitching.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        stitching.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         for col in range(4):
             stitching.columnconfigure(col, weight=1)
         ttk.Label(stitching, textvariable=self.stitch_corner_var).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(stitching, textvariable=self.stitch_plane_var).grid(row=0, column=2, columnspan=2, sticky="w")
-        ttk.Button(stitching, text="Record Corner", command=self._record_stitching_corner).grid(row=1, column=0, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Button(stitching, text="Delete Last Corner", command=self._delete_last_stitching_corner).grid(row=1, column=1, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Button(stitching, text="Clear Corners", command=self._clear_stitching_corners).grid(row=1, column=2, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Button(stitching, text="Run Offline Stitch", command=self._run_offline_stitching).grid(row=1, column=3, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Label(stitching, text="Rows").grid(row=2, column=0, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_rows_var, width=7).grid(row=2, column=1, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Cols").grid(row=2, column=2, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_cols_var, width=7).grid(row=2, column=3, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Speed %").grid(row=3, column=0, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_speed_var, width=7).grid(row=3, column=1, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Settle s").grid(row=3, column=2, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_settle_seconds_var, width=7).grid(row=3, column=3, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Frames/tile").grid(row=4, column=0, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_sample_frames_var, width=7).grid(row=4, column=1, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Pixels/pulse").grid(row=4, column=2, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_pixels_per_pulse_var, width=7).grid(row=4, column=3, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Output root").grid(row=5, column=0, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=5, column=1, columnspan=3, sticky="ew", padx=2)
-        ttk.Button(stitching, text="Start Stitching Scan", command=self._start_stitching_scan).grid(row=6, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Button(stitching, text="Stop Stitching Scan", command=self._stop_stitching_scan).grid(row=6, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=7, column=0, columnspan=4, sticky="w")
-        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=330).grid(row=8, column=0, columnspan=4, sticky="w")
-        self.stitch_notebook = ttk.Notebook(stitching)
-        self.stitch_notebook.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        self.stitch_plane_tab = ttk.Frame(self.stitch_notebook, padding=4)
-        self.stitch_notebook.add(self.stitch_plane_tab, text="Plane View")
-        self.stitch_plane_canvas = tk.Canvas(self.stitch_plane_tab, width=320, height=180, bg="#101820", highlightthickness=0)
-        self.stitch_plane_canvas.grid(row=0, column=0, sticky="ew")
-        self._draw_stitching_plane_view()
+        ttk.Label(stitching, textvariable=self.stitch_plane_var, wraplength=300).grid(row=1, column=0, columnspan=4, sticky="w")
+        ttk.Button(stitching, text="Record Corner", command=self._record_stitching_corner).grid(row=2, column=0, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(stitching, text="Delete Last", command=self._delete_last_stitching_corner).grid(row=2, column=2, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(stitching, text="Clear", command=self._clear_stitching_corners).grid(row=2, column=3, sticky="ew", padx=2, pady=(6, 2))
+        for index, (label, variable) in enumerate(
+            [("Rows", self.stitch_rows_var), ("Cols", self.stitch_cols_var), ("Speed %", self.stitch_speed_var), ("Settle s", self.stitch_settle_seconds_var), ("Frames/tile", self.stitch_sample_frames_var), ("Pixels/pulse", self.stitch_pixels_per_pulse_var)]
+        ):
+            row, col = 3 + index // 2, (index % 2) * 2
+            ttk.Label(stitching, text=label).grid(row=row, column=col, sticky="w")
+            ttk.Entry(stitching, textvariable=variable, width=7).grid(row=row, column=col + 1, sticky="ew", padx=2)
+        ttk.Label(stitching, text="Output root").grid(row=6, column=0, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=6, column=1, columnspan=3, sticky="ew", padx=2)
+        ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=7, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=7, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Button(stitching, text="Run Offline Stitch", command=self._run_offline_stitching).grid(row=8, column=0, columnspan=4, sticky="ew", padx=2, pady=2)
+        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=9, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=10, column=0, columnspan=4, sticky="w")
 
         camera_controls = ttk.LabelFrame(right, text="Camera Controls", padding=8)
-        camera_controls.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        camera_controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         for col in range(4):
             camera_controls.columnconfigure(col, weight=1)
-        ttk.Button(camera_controls, text="Read Camera Properties", command=self._read_camera_properties).grid(row=0, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(camera_controls, text="Read Properties", command=self._read_camera_properties).grid(row=0, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
         ttk.Button(camera_controls, text="Reduce Overexposure", command=self._reduce_overexposure).grid(row=0, column=2, columnspan=2, sticky="ew", padx=2, pady=2)
         ttk.Checkbutton(camera_controls, text="Auto Exposure", variable=self.auto_exposure_var).grid(row=1, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(camera_controls, text="Auto White Balance", variable=self.auto_wb_var).grid(row=1, column=2, columnspan=2, sticky="w")
-        settings = [
-            ("Exposure", self.exposure_var),
-            ("Gain", self.gain_var),
-            ("Brightness", self.brightness_setting_var),
-            ("Contrast", self.contrast_var),
-            ("WB Temp", self.wb_temperature_var),
-        ]
-        for index, (label, variable) in enumerate(settings, start=2):
-            row = 2 + (index - 2) // 2
-            col = ((index - 2) % 2) * 2
+        for index, (label, variable) in enumerate(
+            [("Exposure", self.exposure_var), ("Gain", self.gain_var), ("Brightness", self.brightness_setting_var), ("Contrast", self.contrast_var), ("WB Temp", self.wb_temperature_var)]
+        ):
+            row, col = 2 + index // 2, (index % 2) * 2
             ttk.Label(camera_controls, text=label).grid(row=row, column=col, sticky="w")
             ttk.Entry(camera_controls, textvariable=variable, width=8).grid(row=row, column=col + 1, sticky="ew", padx=2)
-        ttk.Button(camera_controls, text="Apply Camera Settings", command=self._apply_camera_settings).grid(row=5, column=0, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Button(camera_controls, text="Reset Auto Camera Mode", command=self._reset_auto_camera_mode).grid(row=5, column=2, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Label(camera_controls, textvariable=self.camera_properties_var, wraplength=310).grid(row=6, column=0, columnspan=4, sticky="w")
+        ttk.Button(camera_controls, text="Apply Settings", command=self._apply_camera_settings).grid(row=5, column=0, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(camera_controls, text="Reset Auto Mode", command=self._reset_auto_camera_mode).grid(row=5, column=2, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Label(camera_controls, textvariable=self.camera_properties_var, wraplength=300).grid(row=6, column=0, columnspan=4, sticky="w")
 
-        focus_info = ttk.LabelFrame(middle, text="Focus Info", padding=8)
-        focus_info.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        for row, variable in enumerate(
-            [self.focus_var, self.brightness_var, self.saturation_var, self.underexposed_var, self.exposure_warning_var]
-        ):
-            ttk.Label(focus_info, textvariable=variable).grid(row=row, column=0, sticky="w")
-
-        mode_panel = ttk.LabelFrame(middle, text="Mode-specific panel", padding=8)
-        mode_panel.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(mode_panel, textvariable=self.mode_message_var, wraplength=310).grid(row=0, column=0, sticky="w")
-
-        warning = ttk.Label(middle, textvariable=self.status_var, wraplength=360, foreground="#8a4b00")
-        warning.grid(row=5, column=0, sticky="ew")
-
-        video_frame = ttk.LabelFrame(right, text="Camera Preview", padding=4)
-        video_frame.grid(row=0, column=0, sticky="ne")
-        self.video_label = ttk.Label(video_frame, text="No camera", anchor="center")
-        self.video_label.grid(row=0, column=0, sticky="nsew")
+        self._on_autofocus_mode_change()
         self._apply_mode_layout()
 
     def _bind_keys(self) -> None:
@@ -832,28 +691,15 @@ class ProbeStationApp(tk.Tk):
 
     def _on_mode_change(self) -> None:
         mode = self._current_mode()
-        spec = mode_panel_spec(mode)
         self.current_mode_var.set(f"Current mode: {mode.value}")
-        if mode != Mode.FOCUS_ASSIST:
-            self.manual_focus_assist.recording = False
-            self._refresh_focus_assist_labels()
-        self.mode_message_var.set(
-            f"{spec.message}\nActions: {', '.join(spec.primary_actions)}\nStatus: {', '.join(spec.status_fields)}"
-        )
         self._apply_mode_layout()
         LOG.info("mode switched: %s", mode.value)
         self._set_status(f"Mode switched to {mode.value}. 软件急停不能替代物理急停。")
 
     def _apply_mode_layout(self) -> None:
         spec = mode_panel_spec(self._current_mode())
-        focus_visible = "focus_assist" in spec.visible_sections
         autofocus_visible = "autofocus" in spec.visible_sections
         stitching_visible = "image_stitching" in spec.visible_sections
-        if hasattr(self, "focus_panel"):
-            if focus_visible:
-                self.focus_panel.grid()
-            else:
-                self.focus_panel.grid_remove()
         if hasattr(self, "autofocus_panel"):
             if autofocus_visible:
                 self.autofocus_panel.grid()
@@ -864,6 +710,14 @@ class ProbeStationApp(tk.Tk):
                 self.stitching_panel.grid()
             else:
                 self.stitching_panel.grid_remove()
+        if autofocus_visible:
+            self.af_plot_frame.grid()
+        else:
+            self.af_plot_frame.grid_remove()
+        if stitching_visible:
+            self.stitch_plot_frame.grid()
+        else:
+            self.stitch_plot_frame.grid_remove()
 
     def _connect_motor(self) -> None:
         port = self.port_var.get().strip()
@@ -1150,78 +1004,6 @@ class ProbeStationApp(tk.Tk):
         self.software_origin = dict(self.absolute_pos)
         self._update_position_labels()
         self._set_status("Software origin set locally. No D3 clear command was sent.")
-
-    def _start_focus_assist(self) -> None:
-        self.mode_var.set(Mode.FOCUS_ASSIST.value)
-        self._on_mode_change()
-        self.manual_focus_assist.reset_best(keep_recording=True)
-        self.focus_history.clear()
-        self.focus_z_history.clear()
-        self._draw_focus_curve()
-        self._refresh_focus_assist_labels()
-        if not self.camera.is_open:
-            LOG.warning("camera not opened while starting manual focus assist")
-            self.focus_assist_message_var.set("相机未打开，无法进行 focus assist")
-        self._set_status("Manual focus assist started. Move Z manually to collect focus samples.")
-        self._record_mission_event("focus_assist_started")
-
-    def _stop_focus_assist(self) -> None:
-        self.manual_focus_assist.recording = False
-        self._refresh_focus_assist_labels()
-        self._set_status("Manual focus assist stopped.")
-        self._record_mission_event("focus_assist_stopped")
-
-    def _reset_best_focus(self) -> None:
-        self.manual_focus_assist.reset_best(keep_recording=self.manual_focus_assist.recording)
-        self.focus_history.clear()
-        self.focus_z_history.clear()
-        self._draw_focus_curve()
-        self._refresh_focus_assist_labels()
-        self._set_status("Manual focus best record reset.")
-        self._record_mission_event("best_focus_reset")
-
-    def _go_to_best_z(self) -> None:
-        best_z_abs = self.manual_focus_assist.best_z_abs
-        if best_z_abs is None:
-            self._set_status("No best Z recorded yet.")
-            return
-        if not self.controller or not self.controller.is_open:
-            self._set_status("Motor is not connected.")
-            return
-        if not self.position_available["Z"]:
-            LOG.error("Z position unavailable; cannot go to best Z")
-            self._set_status("Current Z position is unavailable; cannot Go To Best Z.")
-            return
-        confirmed = messagebox.askokcancel(
-            "Confirm Go To Best Z",
-            "即将移动 Z 轴回到记录的最佳焦点位置。请确认样品/探针/镜头安全，物理急停可用。\n\n"
-            "软件急停不能替代物理急停。",
-        )
-        if not confirmed:
-            self._set_status("Go To Best Z cancelled.")
-            return
-        delta = best_z_abs - self.absolute_pos["Z"]
-        if delta == 0:
-            self._set_status("Already at recorded best Z.")
-            return
-        direction = 1 if delta > 0 else -1
-        pulses = abs(delta)
-        speed = min(self._read_speed(default=2), 5)
-        LOG.info("Go To Best Z started: current=%s best=%s delta=%s speed=%s", self.absolute_pos["Z"], best_z_abs, delta, speed)
-
-        def worker() -> None:
-            try:
-                controller_direction = logical_direction_to_controller_direction("Z", direction)
-                self.controller.move_relative("Z", controller_direction, pulses, speed)
-                positions = self._safe_read_positions(self.controller)
-                self.device_queue.put(("positions", positions))
-                LOG.info("Go To Best Z completed")
-                self.device_queue.put(("status", "Moved to recorded best Z."))
-            except Exception as exc:
-                LOG.exception("go to best z failed")
-                self.device_queue.put(("error", f"Go To Best Z failed: {exc}"))
-
-        threading.Thread(target=worker, daemon=True).start()
 
     def _record_stitching_corner(self) -> None:
         self.mode_var.set(Mode.IMAGE_STITCHING.value)
@@ -1758,7 +1540,7 @@ class ProbeStationApp(tk.Tk):
                 self.device_queue.put(
                     (
                         "af_done",
-                        "自动对焦完成，但确认分数偏低，建议重试或使用手动辅助对焦。",
+                        "自动对焦完成，但确认分数偏低，建议重试或手动调整焦点。",
                     )
                 )
             LOG.info("Autofocus completed")
@@ -1886,38 +1668,7 @@ class ProbeStationApp(tk.Tk):
         self._schedule_after(60, self._camera_loop)
 
     def _update_focus(self, focus_index: float) -> None:
-        self.focus_var.set(f"Focus index: {focus_index:.2f}")
-        if not self.enable_focus_assist:
-            return
-        if not self.manual_focus_assist.recording:
-            self._refresh_focus_assist_labels()
-            return
-        if not self.camera.is_open:
-            LOG.warning("camera not opened while trying to record focus")
-            self.focus_assist_message_var.set("相机未打开，无法进行 focus assist")
-            return
-        if not self.position_available["Z"]:
-            LOG.warning("Z position unavailable while trying to record focus")
-            self.focus_assist_message_var.set("等待 Z 位置")
-            self._refresh_focus_assist_labels()
-            return
-        z = self.absolute_pos["Z"]
-        z_rel = z - self.software_origin["Z"]
-        self.focus_history.append(float(focus_index))
-        self.focus_z_history.append(z)
-        if len(self.focus_history) > 240:
-            self.focus_history = self.focus_history[-240:]
-            self.focus_z_history = self.focus_z_history[-240:]
-        if self.manual_focus_assist.record_sample(float(focus_index), z_abs=z, z_rel=z_rel):
-            LOG.info(
-                "best focus updated: focus=%.2f z_abs=%s z_rel=%s",
-                self.manual_focus_assist.best_focus_index,
-                self.manual_focus_assist.best_z_abs,
-                self.manual_focus_assist.best_z_rel,
-            )
-        self.focus_assist_message_var.set("Recording manual focus samples.")
-        self._refresh_focus_assist_labels()
-        self._draw_focus_curve()
+        self.focus_var.set(f"Sharpness index: {focus_index:.2f}")
 
     def _update_focus_diagnostics(self, info: dict[str, float | bool]) -> None:
         mean_brightness = float(info.get("mean_brightness", 0.0))
@@ -1962,35 +1713,6 @@ class ProbeStationApp(tk.Tk):
         ppm = header + np.ascontiguousarray(resized).tobytes()
         self._photo = tk.PhotoImage(data=ppm, format="PPM")
         self.video_label.configure(image=self._photo, text="")
-
-    def _draw_focus_curve(self) -> None:
-        canvas = self.curve_canvas
-        if canvas is None:
-            return
-        canvas.delete("all")
-        width = max(10, canvas.winfo_width())
-        height = max(10, canvas.winfo_height())
-        canvas.create_rectangle(0, 0, width, height, fill="#101820", outline="")
-        if self.manual_focus_assist.recording and self.manual_focus_assist.best_focus_index is not None:
-            canvas.create_text(
-                8,
-                8,
-                anchor="nw",
-                fill="#e6edf3",
-                text=f"Best {self.manual_focus_assist.best_focus_index:.2f}",
-            )
-        if len(self.focus_history) < 2:
-            return
-        values = np.asarray(self.focus_history, dtype=np.float64)
-        lo = float(values.min())
-        hi = float(values.max())
-        span = max(1.0, hi - lo)
-        points = []
-        for index, value in enumerate(values):
-            x = index * (width - 1) / max(1, len(values) - 1)
-            y = height - 4 - ((value - lo) / span) * (height - 8)
-            points.extend([x, y])
-        canvas.create_line(*points, fill="#4cc9f0", width=2)
 
     def _drain_device_queue(self) -> None:
         if self._closing:
@@ -2119,43 +1841,12 @@ class ProbeStationApp(tk.Tk):
             f"Abs X={self.absolute_pos['X']}  Y={self.absolute_pos['Y']}  Z={self.absolute_pos['Z']}"
         )
         self.rel_pos_var.set(f"Rel X={rel['X']}  Y={rel['Y']}  Z={rel['Z']}")
-        self._refresh_focus_assist_labels()
         self._refresh_stitching_labels()
 
     def _mark_positions_available(self, positions: dict[str, int]) -> None:
         for axis in positions:
             if axis in self.position_available:
                 self.position_available[axis] = True
-
-    def _refresh_focus_assist_labels(self) -> None:
-        if not self.enable_focus_assist:
-            return
-        state = self.manual_focus_assist
-        if self.position_available["Z"]:
-            z_abs = self.absolute_pos["Z"]
-            z_rel = z_abs - self.software_origin["Z"]
-            self.current_z_abs_var.set(f"Current Z absolute: {z_abs}")
-            self.current_z_rel_var.set(f"Current Z relative: {z_rel}")
-        else:
-            self.current_z_abs_var.set("Current Z absolute: waiting")
-            self.current_z_rel_var.set("Current Z relative: waiting")
-
-        self.focus_recording_var.set(f"Recording: {'yes' if state.recording else 'no'}")
-        if state.best_focus_index is None:
-            self.best_focus_var.set("Best focus index: --")
-            self.best_z_abs_var.set("Best Z absolute: --")
-            self.best_z_rel_var.set("Best Z relative: --")
-            self.best_focus_time_var.set("Best focus time: --")
-            return
-
-        self.best_focus_var.set(f"Best focus index: {state.best_focus_index:.2f}")
-        self.best_z_abs_var.set(f"Best Z absolute: {state.best_z_abs}")
-        self.best_z_rel_var.set(f"Best Z relative: {state.best_z_rel}")
-        if state.best_timestamp is None:
-            self.best_focus_time_var.set("Best focus time: --")
-        else:
-            time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.best_timestamp))
-            self.best_focus_time_var.set(f"Best focus time: {time_text}")
 
     def _refresh_autofocus_labels(self) -> None:
         if not self.enable_autofocus:

@@ -45,13 +45,10 @@ the USB-serial driver.
 
 ## Modes
 
-Use the GUI `Mode Selector` to switch between:
+Use the top mode drop-down to switch between:
 
-- `Manual Mode`: manual X/Y/Z movement only. Focus index is shown, but no best
+- `Manual Mode`: manual X/Y/Z movement only. Sharpness index is shown, but no best
   focus is recorded and no automatic movement happens.
-- `Manual Focus Assist`: the user still moves Z manually. The GUI records focus
-  index and best Z, then `Go To Best Z` can return to the recorded Z at low speed
-  after confirmation.
 - `Auto Focus`: conservative full-scan autofocus. It only moves Z. It does not
   move X/Y, perform snake scanning, stitching, or multi-point measurement.
   `Semi Auto` uses the user range/step. `Full Auto` currently accepts only range
@@ -80,17 +77,15 @@ shortcuts.
 ## Real-Hardware Test Order
 
 1. Start in `Manual Mode` and test X/Y/Z with small steps.
-2. Use `Manual Focus Assist` to verify focus index, best focus recording, and
-   `Go To Best Z`.
-3. Use `Auto Focus` only after manual movement and focus assist are stable.
-4. Before autofocus, manually move close to focus.
-5. First autofocus parameters:
+2. Use `Auto Focus` only after manual movement and live sharpness readings are stable.
+3. Before autofocus, manually move close to focus.
+4. First autofocus parameters:
    - `half-range = 20`
    - `scan_step = 5`
    - `speed = 1` or `2`
    - `settle_seconds = 0.5`
    - `sample_seconds = 1.5`
-6. Use `Image Stitching` only after manual X/Y/Z and camera capture are stable.
+5. Use `Image Stitching` only after manual X/Y/Z and camera capture are stable.
    First stitching test should be a small `2 x 2` or `3 x 3` scan over a safe
    area with no probe contact.
 
@@ -118,7 +113,7 @@ placement instead of forcing a bad correction. Each tile is sampled multiple
 times and the clearest acceptable frame is saved, which helps while the
 temporary setup is still vibration-prone.
 
-The `Plane View` tab in the `Image Stitching` panel shows the recorded corner
+The dynamic display below the shared camera preview shows recorded corner
 points, planned tile locations, and the current tile while scanning.
 
 ## Camera Overexposure
@@ -171,13 +166,13 @@ INVERT_Z_DIRECTION = False
 ```
 
 X was swapped after later real-machine manual-control feedback. Y remains
-software-inverted. Z keeps the successful Manual Focus Assist direction.
+software-inverted. Z retains its verified manual-control direction.
 
 ## Module Layout
 
 - `main.py`: single recommended entry point.
-- `gui_app.py`: unified GUI, mode selector, manual controls, camera controls,
-  Manual Focus Assist, and Auto Focus.
+- `gui_app.py`: unified GUI, top mode selector, shared camera preview, manual
+  controls, camera controls, Auto Focus, and Image Stitching.
 - `stage_protocol.py`: 12-byte protocol frame helpers for X/Y/Z/ALL only.
 - `stage_controller.py`: serial connection, D4 realtime-upload disable on open,
   movement, B5 arrival wait, position reads, stop, and emergency stop.
@@ -219,5 +214,5 @@ on multi-frame robust scoring and IQR stability selection.
 
 `debug.log` records startup, motor connection, camera connection, camera
 property reads/writes, Reduce Overexposure steps, mode switches, manual moves,
-Stop, Emergency Stop, Manual Focus Assist events, autofocus points/final offset,
-confirm score, and exception tracebacks.
+Stop, Emergency Stop, autofocus points/final offset, confirm score, image
+stitching progress, and exception tracebacks.
