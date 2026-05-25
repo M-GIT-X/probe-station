@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Iterable
 
 import numpy as np
@@ -77,3 +78,13 @@ def bounds_from_plane_points(points: Iterable[SamplePlanePoint]):
         min_y=min(point.y for point in measured),
         max_y=max(point.y for point in measured),
     )
+
+
+def boundary_polygon_from_points(points: Iterable[SamplePlanePoint]) -> list[tuple[int, int]]:
+    measured = list(points)
+    if len(measured) < 3:
+        raise ValueError("at least three points are required to make a boundary")
+    center_x = sum(point.x for point in measured) / len(measured)
+    center_y = sum(point.y for point in measured) / len(measured)
+    ordered = sorted(measured, key=lambda point: math.atan2(point.y - center_y, point.x - center_x))
+    return [(point.x, point.y) for point in ordered]

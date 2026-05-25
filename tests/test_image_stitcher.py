@@ -63,6 +63,26 @@ class ImageStitcherTest(unittest.TestCase):
 
         self.assertEqual(result.shape, (40, 80, 3))
 
+    def test_signed_axis_calibration_places_tiles_in_camera_orientation(self):
+        left = np.zeros((20, 30, 3), dtype=np.uint8)
+        right = np.zeros((20, 30, 3), dtype=np.uint8)
+        left[:, :, 1] = 80
+        right[:, :, 2] = 160
+        tiles = [
+            TileRecord(row=0, col=0, x=0, y=0, z=0, filename="left.png", focus_score=1.0),
+            TileRecord(row=0, col=1, x=20, y=0, z=0, filename="right.png", focus_score=1.0),
+        ]
+
+        mosaic = stitch_tiles_by_stage_coordinates(
+            [left, right],
+            tiles,
+            x_pixels_per_pulse=-1.0,
+            y_pixels_per_pulse=1.0,
+        )
+
+        self.assertEqual(int(mosaic[5, 5, 2]), 160)
+        self.assertEqual(int(mosaic[5, 45, 1]), 80)
+
     def test_stitch_session_by_metadata_writes_output_image(self):
         try:
             import cv2
@@ -88,6 +108,31 @@ class ImageStitcherTest(unittest.TestCase):
             output = stitch_session_by_metadata(root, pixels_per_pulse=1.0)
 
             self.assertTrue(output.exists())
+            mosaic = cv2.imread(str(output))
+            self.assertEqual(mosaic.shape, (20, 50, 3))
+
+    def test_stitch_session_reads_automatic_axis_calibration_from_metadata(self):
+        try:
+            import cv2
+        except ImportError:
+            self.skipTest("OpenCV is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            frame = np.zeros((20, 30, 3), dtype=np.uint8)
+            cv2.imwrite(str(root / "left.png"), frame)
+            cv2.imwrite(str(root / "right.png"), frame)
+            metadata = {
+                "calibration": {"x_pixels_per_pulse": 0.5, "y_pixels_per_pulse": 0.5},
+                "tiles": [
+                    {"row": 0, "col": 0, "x": 0, "y": 0, "z": 0, "filename": "left.png", "focus_score": 1.0},
+                    {"row": 0, "col": 1, "x": 40, "y": 0, "z": 0, "filename": "right.png", "focus_score": 1.0},
+                ],
+            }
+            (root / "metadata.json").write_text(__import__("json").dumps(metadata), encoding="utf-8")
+
+            output = stitch_session_by_metadata(root, use_overlap_registration=False)
+
             mosaic = cv2.imread(str(output))
             self.assertEqual(mosaic.shape, (20, 50, 3))
 

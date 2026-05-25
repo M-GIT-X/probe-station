@@ -60,6 +60,7 @@ class StitchingSessionStore:
         tiles: list[TileRecord],
         settings: dict[str, object],
         plane: object | None = None,
+        calibration: object | None = None,
     ) -> Path:
         payload: dict[str, object] = {
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -69,6 +70,8 @@ class StitchingSessionStore:
         }
         if plane is not None and hasattr(plane, "to_dict"):
             payload["plane"] = plane.to_dict()
+        if calibration is not None and hasattr(calibration, "to_dict"):
+            payload["calibration"] = calibration.to_dict()
         path = self.path / "metadata.json"
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return path

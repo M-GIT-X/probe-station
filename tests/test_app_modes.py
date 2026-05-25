@@ -9,6 +9,7 @@ from gui_app import (
     VIDEO_PREVIEW_MAX_HEIGHT,
     VIDEO_PREVIEW_MAX_WIDTH,
     mode_panel_spec,
+    stitching_geometry_input_fields,
 )
 
 
@@ -40,6 +41,9 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertLessEqual(MIN_WINDOW_HEIGHT, 620)
         self.assertLessEqual(VIDEO_PREVIEW_MAX_WIDTH, 420)
         self.assertLessEqual(VIDEO_PREVIEW_MAX_HEIGHT, 240)
+
+    def test_stitching_geometry_only_asks_operator_for_overlap(self):
+        self.assertEqual(stitching_geometry_input_fields(), ("Overlap %",))
 
 
 if __name__ == "__main__":

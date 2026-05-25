@@ -14,25 +14,31 @@ def stitch_tiles_by_stage_coordinates(
     frames: list[np.ndarray],
     tiles: list[TileRecord],
     *,
-    pixels_per_pulse: float,
+    pixels_per_pulse: float | None = None,
+    x_pixels_per_pulse: float | None = None,
+    y_pixels_per_pulse: float | None = None,
     use_overlap_registration: bool = False,
 ) -> np.ndarray:
     if len(frames) != len(tiles):
         raise ValueError("frames and tiles must have the same length")
     if not frames:
         raise ValueError("at least one frame is required")
-    if pixels_per_pulse <= 0:
-        raise ValueError("pixels_per_pulse must be positive")
+    x_scale, y_scale = _axis_scales(pixels_per_pulse, x_pixels_per_pulse, y_pixels_per_pulse)
 
     if use_overlap_registration:
-        positions = refine_tile_positions_by_overlap(frames, tiles, pixels_per_pulse=pixels_per_pulse)
+        positions = refine_tile_positions_by_overlap(
+            frames,
+            tiles,
+            x_pixels_per_pulse=x_scale,
+            y_pixels_per_pulse=y_scale,
+        )
     else:
         min_x = min(tile.x for tile in tiles)
         min_y = min(tile.y for tile in tiles)
         positions = {
             index: (
-                int(round((tile.x - min_x) * pixels_per_pulse)),
-                int(round((tile.y - min_y) * pixels_per_pulse)),
+                int(round((tile.x - min_x) * x_scale)),
+                int(round((tile.y - min_y) * y_scale)),
             )
             for index, tile in enumerate(tiles)
         }
@@ -76,14 +82,15 @@ def refine_tile_positions_by_overlap(
     frames: list[np.ndarray],
     tiles: list[TileRecord],
     *,
-    pixels_per_pulse: float,
+    pixels_per_pulse: float | None = None,
+    x_pixels_per_pulse: float | None = None,
+    y_pixels_per_pulse: float | None = None,
     max_correction: int = 60,
 ) -> dict[int, tuple[int, int]]:
     """Refine stage-derived tile positions by matching adjacent overlaps."""
     if len(frames) != len(tiles):
         raise ValueError("frames and tiles must have the same length")
-    if pixels_per_pulse <= 0:
-        raise ValueError("pixels_per_pulse must be positive")
+    x_scale, y_scale = _axis_scales(pixels_per_pulse, x_pixels_per_pulse, y_pixels_per_pulse)
     if not frames:
         return {}
 
@@ -91,8 +98,8 @@ def refine_tile_positions_by_overlap(
     min_y = min(tile.y for tile in tiles)
     expected = {
         index: (
-            int(round((tile.x - min_x) * pixels_per_pulse)),
-            int(round((tile.y - min_y) * pixels_per_pulse)),
+            int(round((tile.x - min_x) * x_scale)),
+            int(round((tile.y - min_y) * y_scale)),
         )
         for index, tile in enumerate(tiles)
     }
@@ -160,6 +167,19 @@ def _estimate_neighbor_delta(
     return best_delta
 
 
+def _axis_scales(
+    pixels_per_pulse: float | None,
+    x_pixels_per_pulse: float | None,
+    y_pixels_per_pulse: float | None,
+) -> tuple[float, float]:
+    default_scale = 1.0 if pixels_per_pulse is None else float(pixels_per_pulse)
+    x_scale = default_scale if x_pixels_per_pulse is None else float(x_pixels_per_pulse)
+    y_scale = default_scale if y_pixels_per_pulse is None else float(y_pixels_per_pulse)
+    if x_scale == 0.0 or y_scale == 0.0:
+        raise ValueError("pixel-per-pulse calibration must be non-zero")
+    return x_scale, y_scale
+
+
 def _as_gray_float(frame: np.ndarray) -> np.ndarray:
     arr = np.asarray(frame)
     if arr.ndim == 3:
@@ -191,7 +211,7 @@ def _overlap_mse(anchor: np.ndarray, moving: np.ndarray, dx: int, dy: int) -> fl
 def stitch_session_by_metadata(
     session_path: Path | str,
     *,
-    pixels_per_pulse: float = 1.0,
+    pixels_per_pulse: float | None = None,
     output_name: str = "stitched_mosaic.png",
     use_overlap_registration: bool = True,
 ) -> Path:
@@ -202,6 +222,9 @@ def stitch_session_by_metadata(
 
     root = Path(session_path)
     metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    calibration = metadata.get("calibration", {})
+    x_scale = calibration.get("x_pixels_per_pulse") if pixels_per_pulse is None else None
+    y_scale = calibration.get("y_pixels_per_pulse") if pixels_per_pulse is None else None
     tiles = [TileRecord(**item) for item in metadata.get("tiles", [])]
     frames = []
     for tile in tiles:
@@ -213,6 +236,8 @@ def stitch_session_by_metadata(
         frames,
         tiles,
         pixels_per_pulse=pixels_per_pulse,
+        x_pixels_per_pulse=x_scale,
+        y_pixels_per_pulse=y_scale,
         use_overlap_registration=use_overlap_registration,
     )
     output = root / output_name

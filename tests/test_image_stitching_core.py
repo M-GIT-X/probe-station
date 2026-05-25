@@ -3,9 +3,10 @@ import unittest
 
 import numpy as np
 
-from sample_plane import SamplePlanePoint, fit_sample_plane
-from scan_plan import ScanBounds, generate_stitching_grid
+from sample_plane import SamplePlanePoint, boundary_polygon_from_points, fit_sample_plane
+from scan_plan import ScanBounds, generate_overlap_scan_plan, generate_stitching_grid
 from stitching_store import StitchingSessionStore, TileRecord
+from stitching_calibration import calibration_from_shifts
 
 
 class ImageStitchingCoreTest(unittest.TestCase):
@@ -30,6 +31,19 @@ class ImageStitchingCoreTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "at least three"):
             fit_sample_plane(corners)
+
+    def test_boundary_polygon_orders_corners_for_safe_in_bounds_checks(self):
+        unordered = [
+            SamplePlanePoint("c1", 0, 0, 100),
+            SamplePlanePoint("c3", 100, 100, 100),
+            SamplePlanePoint("c2", 100, 0, 100),
+            SamplePlanePoint("c4", 0, 100, 100),
+        ]
+
+        boundary = boundary_polygon_from_points(unordered)
+
+        self.assertEqual(set(boundary), {(0, 0), (100, 0), (100, 100), (0, 100)})
+        self.assertNotEqual(boundary, [(0, 0), (100, 100), (100, 0), (0, 100)])
 
     def test_generate_stitching_grid_uses_snake_order_and_plane_z(self):
         plane = fit_sample_plane(
@@ -60,6 +74,59 @@ class ImageStitchingCoreTest(unittest.TestCase):
         )
         self.assertEqual(tiles[4].z, 110)
 
+    def test_overlap_scan_plan_derives_tile_count_and_snake_grid_from_calibration(self):
+        plane = fit_sample_plane(
+            [
+                SamplePlanePoint("c1", 0, 0, 100),
+                SamplePlanePoint("c2", 1000, 0, 100),
+                SamplePlanePoint("c3", 1000, 600, 120),
+                SamplePlanePoint("c4", 0, 600, 120),
+            ]
+        )
+        bounds = ScanBounds(min_x=0, max_x=1000, min_y=0, max_y=600)
+
+        plan = generate_overlap_scan_plan(
+            bounds,
+            plane,
+            frame_width=400,
+            frame_height=300,
+            x_pixels_per_pulse=0.5,
+            y_pixels_per_pulse=0.5,
+            overlap_percent=25.0,
+        )
+
+        self.assertEqual(plan.cols, 3)
+        self.assertEqual(plan.rows, 3)
+        self.assertEqual(len(plan.tiles), 9)
+        self.assertEqual([(tile.row, tile.col) for tile in plan.tiles[3:6]], [(1, 2), (1, 1), (1, 0)])
+        self.assertLessEqual(plan.x_step_pulses, 600)
+        self.assertLessEqual(plan.y_step_pulses, 450)
+
+    def test_overlap_scan_plan_drops_centers_outside_four_corner_polygon(self):
+        plane = fit_sample_plane(
+            [
+                SamplePlanePoint("c1", 50, 0, 100),
+                SamplePlanePoint("c2", 100, 50, 100),
+                SamplePlanePoint("c3", 50, 100, 100),
+                SamplePlanePoint("c4", 0, 50, 100),
+            ]
+        )
+        bounds = ScanBounds(min_x=0, max_x=100, min_y=0, max_y=100)
+        boundary = [(50, 0), (100, 50), (50, 100), (0, 50)]
+
+        plan = generate_overlap_scan_plan(
+            bounds,
+            plane,
+            frame_width=50,
+            frame_height=50,
+            x_pixels_per_pulse=1.0,
+            y_pixels_per_pulse=1.0,
+            overlap_percent=20.0,
+            boundary_points=boundary,
+        )
+
+        self.assertTrue(plan.tiles)
+        self.assertNotIn((0, 0), [(tile.x, tile.y) for tile in plan.tiles])
     def test_stitching_store_writes_tile_image_and_metadata(self):
         try:
             import cv2  # noqa: F401
@@ -86,6 +153,29 @@ class ImageStitchingCoreTest(unittest.TestCase):
             self.assertEqual(metadata["settings"], {"rows": 1, "cols": 1})
             self.assertEqual(metadata["tiles"][0]["filename"], saved.filename)
             self.assertEqual(metadata["corners"][0]["label"], "c1")
+
+    def test_stitching_store_persists_automatic_calibration(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StitchingSessionStore.create(Path(temp_dir), "calibrated")
+            calibration = calibration_from_shifts(
+                x_step_pulses=10,
+                y_step_pulses=10,
+                x_frame_shift=(-5.0, 0.0),
+                y_frame_shift=(0.0, -4.0),
+                frame_width=100,
+                frame_height=80,
+                overlap_percent=20.0,
+                confidence=0.8,
+            )
+
+            store.write_metadata(corners=[], tiles=[], settings={}, calibration=calibration)
+
+            metadata = json.loads((store.path / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["calibration"]["x_pixels_per_pulse"], 0.5)
+            self.assertEqual(metadata["calibration"]["overlap_percent"], 20.0)
 
     def test_stitching_store_uses_unique_folder_when_name_exists(self):
         import tempfile

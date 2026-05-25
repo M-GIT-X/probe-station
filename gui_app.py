@@ -24,9 +24,10 @@ from focus_metrics import (
     stabilize_frame_translation,
 )
 from image_stitcher import stitch_session_by_metadata
-from sample_plane import SamplePlanePoint, bounds_from_plane_points, fit_sample_plane
-from scan_plan import TilePoint, generate_stitching_grid
+from sample_plane import SamplePlanePoint, boundary_polygon_from_points, bounds_from_plane_points, fit_sample_plane
+from scan_plan import TilePoint, generate_overlap_scan_plan
 from stage_controller import StageController
+from stitching_calibration import StitchingCalibration, build_in_bounds_trial_plan, estimate_calibration_from_frames
 from stitching_store import StitchingSessionStore, TileRecord
 from stitching_view_model import build_stitching_view_model
 
@@ -63,6 +64,7 @@ MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
 VIDEO_PREVIEW_MAX_WIDTH = 420
 VIDEO_PREVIEW_MAX_HEIGHT = 240
+CROSSHAIR_COLOR_RGB = (57, 255, 20)
 
 
 def list_serial_port_names() -> list[str]:
@@ -153,6 +155,15 @@ def manual_shortcut_mapping(key: str) -> tuple[str, int] | None:
     return mapping.get(key.lower())
 
 
+def draw_preview_crosshair(rgb_frame: np.ndarray) -> np.ndarray:
+    overlaid = rgb_frame.copy()
+    center_y = overlaid.shape[0] // 2
+    center_x = overlaid.shape[1] // 2
+    overlaid[center_y, :, :3] = CROSSHAIR_COLOR_RGB
+    overlaid[:, center_x, :3] = CROSSHAIR_COLOR_RGB
+    return overlaid
+
+
 def logical_direction_to_controller_direction(axis: str, logical_sign: int) -> int:
     sign = 1 if logical_sign >= 0 else -1
     invert_by_axis = {
@@ -205,6 +216,10 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
         status_fields=("Absolute position", "Relative position", "Live focus index"),
         message="Manual Mode: manual X/Y/Z control only; no recording and no automatic movement.",
     )
+
+
+def stitching_geometry_input_fields() -> tuple[str, ...]:
+    return ("Overlap %",)
 
 @dataclass(frozen=True)
 class AutofocusParams:
@@ -264,6 +279,7 @@ class StitchingRunState:
     corners: list[SamplePlanePoint] | None = None
     planned_tiles: list[TilePoint] | None = None
     current_tile_index: int | None = None
+    calibration: StitchingCalibration | None = None
     last_session_path: Path | None = None
     last_mosaic_path: Path | None = None
 
@@ -455,15 +471,15 @@ class ProbeStationApp(tk.Tk):
         self.af_final_offset_var = tk.StringVar(value="Final offset: --")
         self.af_confirm_score_var = tk.StringVar(value="Confirm score: --")
         self.af_sample_count_var = tk.StringVar(value="Sample points: 0")
-        self.stitch_rows_var = tk.StringVar(value="3")
-        self.stitch_cols_var = tk.StringVar(value="3")
+        self.stitch_overlap_var = tk.StringVar(value="25")
         self.stitch_speed_var = tk.StringVar(value="2")
         self.stitch_settle_seconds_var = tk.StringVar(value="0.5")
         self.stitch_sample_frames_var = tk.StringVar(value="5")
-        self.stitch_pixels_per_pulse_var = tk.StringVar(value="1.0")
         self.stitch_output_root_var = tk.StringVar(value=str(Path(__file__).with_name("stitching_output")))
         self.stitch_corner_var = tk.StringVar(value="Corners: 0/4")
         self.stitch_plane_var = tk.StringVar(value="Plane: not fitted")
+        self.stitch_calibration_var = tk.StringVar(value="Calibration: pending")
+        self.stitch_plan_var = tk.StringVar(value="Plan: pending")
         self.stitch_progress_var = tk.StringVar(value="Progress: idle")
         self.stitch_output_var = tk.StringVar(value="Output: --")
         self.abs_pos_var = tk.StringVar(value="Abs X=0  Y=0  Z=0")
@@ -628,18 +644,20 @@ class ProbeStationApp(tk.Tk):
         ttk.Button(stitching, text="Delete Last", command=self._delete_last_stitching_corner).grid(row=2, column=2, sticky="ew", padx=2, pady=(6, 2))
         ttk.Button(stitching, text="Clear", command=self._clear_stitching_corners).grid(row=2, column=3, sticky="ew", padx=2, pady=(6, 2))
         for index, (label, variable) in enumerate(
-            [("Rows", self.stitch_rows_var), ("Cols", self.stitch_cols_var), ("Speed %", self.stitch_speed_var), ("Settle s", self.stitch_settle_seconds_var), ("Frames/tile", self.stitch_sample_frames_var), ("Pixels/pulse", self.stitch_pixels_per_pulse_var)]
+            [("Overlap %", self.stitch_overlap_var), ("Speed %", self.stitch_speed_var), ("Settle s", self.stitch_settle_seconds_var), ("Frames/tile", self.stitch_sample_frames_var)]
         ):
             row, col = 3 + index // 2, (index % 2) * 2
             ttk.Label(stitching, text=label).grid(row=row, column=col, sticky="w")
             ttk.Entry(stitching, textvariable=variable, width=7).grid(row=row, column=col + 1, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Output root").grid(row=6, column=0, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=6, column=1, columnspan=3, sticky="ew", padx=2)
-        ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=7, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=7, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Button(stitching, text="Run Offline Stitch", command=self._run_offline_stitching).grid(row=8, column=0, columnspan=4, sticky="ew", padx=2, pady=2)
-        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=9, column=0, columnspan=4, sticky="w")
-        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=10, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, text="Output root").grid(row=5, column=0, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=5, column=1, columnspan=3, sticky="ew", padx=2)
+        ttk.Label(stitching, textvariable=self.stitch_calibration_var, wraplength=300).grid(row=6, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_plan_var, wraplength=300).grid(row=7, column=0, columnspan=4, sticky="w")
+        ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=8, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=8, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Button(stitching, text="Run Offline Stitch", command=self._run_offline_stitching).grid(row=9, column=0, columnspan=4, sticky="ew", padx=2, pady=2)
+        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=10, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=11, column=0, columnspan=4, sticky="w")
 
         camera_controls = ttk.LabelFrame(right, text="Camera Controls", padding=8)
         camera_controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1052,6 +1070,9 @@ class ProbeStationApp(tk.Tk):
         self.stitching.corners = []
         self.stitching.planned_tiles = []
         self.stitching.current_tile_index = None
+        self.stitching.calibration = None
+        self.stitch_calibration_var.set("Calibration: pending")
+        self.stitch_plan_var.set("Plan: pending")
         self._refresh_stitching_labels()
         self._draw_stitching_plane_view()
         self._set_status("Stitching corners cleared.")
@@ -1084,7 +1105,14 @@ class ProbeStationApp(tk.Tk):
         if not corners and not tiles:
             canvas.create_text(10, 10, anchor="nw", fill="#e6edf3", text="Record focused corners to preview the scan plane.")
             return
-        model = build_stitching_view_model(corners, tiles, current_tile_index=self.stitching.current_tile_index)
+        display_corners = corners
+        if len(corners) >= 3:
+            boundary = boundary_polygon_from_points(corners)
+            display_corners = [
+                next(corner for corner in corners if (corner.x, corner.y) == coordinate)
+                for coordinate in boundary
+            ]
+        model = build_stitching_view_model(display_corners, tiles, current_tile_index=self.stitching.current_tile_index)
 
         def xy(point):
             x = margin + point.nx * max(1, width - margin * 2)
@@ -1111,18 +1139,20 @@ class ProbeStationApp(tk.Tk):
             canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ffd33d", outline="#ffffff")
             canvas.create_text(x + 7, y - 7, anchor="w", fill="#e6edf3", text=f"{point.label} z={point.z}")
 
-    def _read_stitching_params(self) -> tuple[int, int, int, float, int, float, Path]:
+    def _read_stitching_params(self) -> tuple[float, int, float, int, Path]:
         try:
-            rows = max(1, int(float(self.stitch_rows_var.get())))
-            cols = max(1, int(float(self.stitch_cols_var.get())))
+            overlap_percent = float(self.stitch_overlap_var.get())
+            if not 0.0 <= overlap_percent < 90.0:
+                raise ValueError("Overlap % must be between 0 and 90.")
             speed = max(1, min(100, int(float(self.stitch_speed_var.get()))))
             settle_seconds = max(0.0, float(self.stitch_settle_seconds_var.get()))
             sample_frames = max(1, int(float(self.stitch_sample_frames_var.get())))
-            pixels_per_pulse = max(0.0001, float(self.stitch_pixels_per_pulse_var.get()))
         except ValueError as exc:
+            if "Overlap" in str(exc):
+                raise
             raise ValueError("Image stitching parameters must be numbers.") from exc
         output_root = Path(self.stitch_output_root_var.get()).expanduser()
-        return rows, cols, speed, settle_seconds, sample_frames, pixels_per_pulse, output_root
+        return overlap_percent, speed, settle_seconds, sample_frames, output_root
 
     def _start_stitching_scan(self) -> None:
         self.mode_var.set(Mode.IMAGE_STITCHING.value)
@@ -1141,23 +1171,16 @@ class ProbeStationApp(tk.Tk):
             self._set_status("Record exactly four manually focused stitching corners before scanning.")
             return
         try:
-            rows, cols, speed, settle_seconds, sample_frames, pixels_per_pulse, output_root = self._read_stitching_params()
+            overlap_percent, speed, settle_seconds, sample_frames, output_root = self._read_stitching_params()
             plane = fit_sample_plane(corners)
             bounds = bounds_from_plane_points(corners)
-            tiles = generate_stitching_grid(bounds, rows=rows, cols=cols, plane=plane)
-            self.stitching.planned_tiles = tiles
-            self.stitching.current_tile_index = None
-            self._draw_stitching_plane_view()
         except Exception as exc:
             self._set_status(f"Image stitching setup failed: {exc}")
             return
-        if len(tiles) > 100:
-            self._set_status("Image stitching scan limited to 100 tiles for the first safe version.")
-            return
         confirmed = messagebox.askyesno(
             "Confirm Image Stitching Scan",
-            "即将根据四个手动对焦角点拟合样品平面，并自动移动 X/Y/Z 拍摄拼场图片。\n\n"
-            f"Tiles = {rows} x {cols} = {len(tiles)}\n"
+            "即将在四角范围内进行短距离试移和内存试拍，以自动标定视野尺寸，随后自动规划并拍摄拼场图片。\n\n"
+            f"Requested overlap = {overlap_percent:.1f}%\n"
             f"Plane max residual = {plane.max_abs_residual:.2f} pulses\n"
             "请确认扫描范围安全、物理急停可用、没有探针会碰撞。\n"
             "软件急停不能替代物理急停。\n\n是否继续？",
@@ -1168,14 +1191,20 @@ class ProbeStationApp(tk.Tk):
 
         self.stitching.running = True
         self.stitching.stop_requested = False
+        self.stitching.planned_tiles = []
+        self.stitching.current_tile_index = None
+        self.stitching.calibration = None
+        self._draw_stitching_plane_view()
         self._set_manual_controls_enabled(False)
         self.running_state_var.set("Running state: image stitching")
         self.recent_command_var.set("Recent command: Start Image Stitching")
-        self.stitch_progress_var.set("Progress: starting")
-        LOG.info("Start Image Stitching: rows=%s cols=%s speed=%s", rows, cols, speed)
+        self.stitch_progress_var.set("Progress: calibrating inside four-corner boundary")
+        self.stitch_calibration_var.set("Calibration: running")
+        self.stitch_plan_var.set("Plan: waiting for calibration")
+        LOG.info("Start Image Stitching: overlap=%.1f speed=%s", overlap_percent, speed)
         threading.Thread(
             target=self._stitching_scan_worker,
-            args=(corners, plane, tiles, rows, cols, speed, settle_seconds, sample_frames, pixels_per_pulse, output_root),
+            args=(corners, plane, bounds, overlap_percent, speed, settle_seconds, sample_frames, output_root),
             daemon=True,
         ).start()
 
@@ -1193,13 +1222,11 @@ class ProbeStationApp(tk.Tk):
         self,
         corners: list[SamplePlanePoint],
         plane,
-        tiles: list[TilePoint],
-        rows: int,
-        cols: int,
+        bounds,
+        overlap_percent: float,
         speed: int,
         settle_seconds: float,
         sample_frames: int,
-        pixels_per_pulse: float,
         output_root: Path,
     ) -> None:
         saved_tiles: list[TileRecord] = []
@@ -1207,6 +1234,59 @@ class ProbeStationApp(tk.Tk):
         try:
             store = StitchingSessionStore.create(output_root)
             self.device_queue.put(("stitch_output", f"Output: {store.path}"))
+            boundary_points = boundary_polygon_from_points(corners)
+            calibration = None
+            used_steps: set[tuple[int, int]] = set()
+            calibration_error = "no trial executed"
+            for requested_step in (5, 10, 20, 40, 80):
+                trial = build_in_bounds_trial_plan(
+                    bounds,
+                    plane,
+                    boundary_points=boundary_points,
+                    preferred_step_pulses=requested_step,
+                )
+                step_key = (trial.x_step_pulses, trial.y_step_pulses)
+                if step_key in used_steps:
+                    continue
+                used_steps.add(step_key)
+                trial_frames = []
+                for label, trial_point in (
+                    ("reference", trial.reference),
+                    ("X", trial.x_trial),
+                    ("Y", trial.y_trial),
+                ):
+                    self._raise_if_stitching_stopped()
+                    self.device_queue.put(
+                        ("stitch_status", f"Progress: calibrating {label} frame ({step_key[0]}/{step_key[1]} pulses)")
+                    )
+                    self._move_to_absolute_position(trial_point.x, trial_point.y, trial_point.z, speed)
+                    self._sleep_with_stitching_stop(settle_seconds)
+                    frame, _focus_score = self._capture_stable_stitching_frame(sample_frames)
+                    trial_frames.append(frame)
+                try:
+                    calibration = estimate_calibration_from_frames(
+                        trial_frames[0], trial_frames[1], trial_frames[2], trial, overlap_percent
+                    )
+                    break
+                except ValueError as exc:
+                    calibration_error = str(exc)
+                    LOG.warning("stitching calibration retry required: step=%s error=%s", step_key, exc)
+            if calibration is None:
+                raise RuntimeError(f"automatic calibration failed inside recorded boundary: {calibration_error}")
+            plan = generate_overlap_scan_plan(
+                bounds,
+                plane,
+                frame_width=calibration.frame_width,
+                frame_height=calibration.frame_height,
+                x_pixels_per_pulse=calibration.x_pixels_per_pulse,
+                y_pixels_per_pulse=calibration.y_pixels_per_pulse,
+                overlap_percent=overlap_percent,
+                boundary_points=boundary_points,
+            )
+            if len(plan.tiles) > 100:
+                raise RuntimeError(f"automatic plan requires {len(plan.tiles)} tiles; first safe version is limited to 100")
+            tiles = plan.tiles
+            self.device_queue.put(("stitch_plan", (calibration, plan)))
             for index, tile in enumerate(tiles, start=1):
                 self._raise_if_stitching_stopped()
                 self.device_queue.put(("stitch_tile_index", index - 1))
@@ -1230,23 +1310,24 @@ class ProbeStationApp(tk.Tk):
                 corners=corners,
                 tiles=saved_tiles,
                 settings={
-                    "rows": rows,
-                    "cols": cols,
+                    "rows": plan.rows,
+                    "cols": plan.cols,
                     "speed": speed,
                     "settle_seconds": settle_seconds,
                     "sample_frames": sample_frames,
-                    "pixels_per_pulse": pixels_per_pulse,
+                    "overlap_percent": overlap_percent,
                 },
                 plane=plane,
+                calibration=calibration,
             )
-            mosaic_path = stitch_session_by_metadata(store.path, pixels_per_pulse=pixels_per_pulse)
+            mosaic_path = stitch_session_by_metadata(store.path)
             self.device_queue.put(("stitch_done", (store.path, mosaic_path)))
         except InterruptedError:
             if store is not None and saved_tiles:
                 store.write_metadata(
                     corners=corners,
                     tiles=saved_tiles,
-                    settings={"stopped": True, "pixels_per_pulse": pixels_per_pulse},
+                    settings={"stopped": True, "overlap_percent": overlap_percent},
                     plane=plane,
                 )
             self.device_queue.put(("stitch_done", (store.path if store else None, None)))
@@ -1307,8 +1388,7 @@ class ProbeStationApp(tk.Tk):
             self._set_status("No stitching session metadata is available yet.")
             return
         try:
-            pixels_per_pulse = max(0.0001, float(self.stitch_pixels_per_pulse_var.get()))
-            mosaic_path = stitch_session_by_metadata(session_path, pixels_per_pulse=pixels_per_pulse)
+            mosaic_path = stitch_session_by_metadata(session_path)
         except Exception as exc:
             self._set_status(f"Offline stitch failed: {exc}")
             return
@@ -1709,6 +1789,7 @@ class ProbeStationApp(tk.Tk):
         new_w = max(1, int(width * scale))
         new_h = max(1, int(height * scale))
         resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        resized = draw_preview_crosshair(resized)
         header = f"P6\n{new_w} {new_h}\n255\n".encode("ascii")
         ppm = header + np.ascontiguousarray(resized).tobytes()
         self._photo = tk.PhotoImage(data=ppm, format="PPM")
@@ -1785,6 +1866,22 @@ class ProbeStationApp(tk.Tk):
                     self._record_mission_event("autofocus_failed", payload)
                 elif kind == "stitch_status":
                     self.stitch_progress_var.set(str(payload))
+                elif kind == "stitch_plan":
+                    calibration, plan = payload
+                    self.stitching.calibration = calibration
+                    self.stitching.planned_tiles = plan.tiles
+                    self.stitching.current_tile_index = None
+                    self.stitch_calibration_var.set(
+                        "Calibration: "
+                        f"X={calibration.x_pixels_per_pulse:.4f} px/pulse  "
+                        f"Y={calibration.y_pixels_per_pulse:.4f} px/pulse  "
+                        f"confidence={calibration.confidence:.2f}"
+                    )
+                    self.stitch_plan_var.set(
+                        f"Plan: {plan.rows} rows x {plan.cols} cols = {len(plan.tiles)} tiles, "
+                        f"overlap={plan.overlap_percent:.1f}%"
+                    )
+                    self._draw_stitching_plane_view()
                 elif kind == "stitch_tile_index":
                     self.stitching.current_tile_index = int(payload)
                     self._draw_stitching_plane_view()

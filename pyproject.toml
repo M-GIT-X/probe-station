@@ -33,5 +33,6 @@ py-modules = [
     "stage_controller",
     "stage_protocol",
     "stitching_store",
+    "stitching_calibration",
     "stitching_view_model",
 ]
