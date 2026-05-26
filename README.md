@@ -118,6 +118,10 @@ placement instead of forcing a bad correction. Each tile is sampled multiple
 times and the clearest acceptable frame is saved, which helps while the
 temporary setup is still vibration-prone.
 
+Overlapping regions are feather blended when the mosaic is written. The
+stitcher intentionally does not propagate per-tile brightness gains, because
+fixed camera or illumination shading can otherwise become stronger stripes.
+
 During automatic mosaic generation, neighboring tile overlaps are also used to
 estimate gentle brightness compensation. This reduces alternating bright/dark
 bands caused by capture exposure variation without independently normalizing

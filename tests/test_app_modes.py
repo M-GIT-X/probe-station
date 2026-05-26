@@ -12,6 +12,7 @@ from gui_app import (
     MISSION_LOG_FOREGROUND_COLOR,
     Mode,
     PREVIEW_PLACEHOLDER_TEXT,
+    AUTOFOCUS_CURVE_HEIGHT,
     STITCHING_PLOT_SIZE,
     VIDEO_PREVIEW_MAX_HEIGHT,
     VIDEO_PREVIEW_MAX_WIDTH,
@@ -47,14 +48,15 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1580x1180")
         self.assertLessEqual(MIN_WINDOW_WIDTH, 960)
         self.assertLessEqual(MIN_WINDOW_HEIGHT, 620)
-        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_WIDTH, 680)
-        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_HEIGHT, 425)
+        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_WIDTH, 760)
+        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_HEIGHT, 475)
         self.assertIn("CAMERA OFFLINE", PREVIEW_PLACEHOLDER_TEXT)
 
-    def test_dynamic_view_dimensions_follow_camera_preview_width(self):
-        self.assertEqual(STITCHING_PLOT_SIZE, VIDEO_PREVIEW_MAX_WIDTH)
-        self.assertGreater(AUTOFOCUS_CURVE_WIDTH, VIDEO_PREVIEW_MAX_WIDTH)
-        self.assertLessEqual(AUTOFOCUS_CURVE_WIDTH - VIDEO_PREVIEW_MAX_WIDTH, 24)
+    def test_dynamic_view_footprints_are_smaller_than_the_primary_preview(self):
+        self.assertEqual(STITCHING_PLOT_SIZE, 555)
+        self.assertEqual((AUTOFOCUS_CURVE_WIDTH, AUTOFOCUS_CURVE_HEIGHT), (580, 130))
+        self.assertLess(STITCHING_PLOT_SIZE, VIDEO_PREVIEW_MAX_WIDTH)
+        self.assertLess(AUTOFOCUS_CURVE_WIDTH, VIDEO_PREVIEW_MAX_WIDTH)
 
     def test_operational_console_and_emergency_button_colors_are_explicit(self):
         self.assertEqual((MISSION_LOG_BACKGROUND_COLOR, MISSION_LOG_FOREGROUND_COLOR), ("#000000", "#39ff14"))

@@ -11,8 +11,6 @@ from stitching_store import TileRecord
 
 _COARSE_REGISTRATION_MAX_DIMENSION = 128
 _INTERMEDIATE_REGISTRATION_MAX_DIMENSION = 512
-_MIN_BRIGHTNESS_GAIN = 0.5
-_MAX_BRIGHTNESS_GAIN = 2.0
 
 
 def stitch_tiles_by_stage_coordinates(
@@ -23,7 +21,6 @@ def stitch_tiles_by_stage_coordinates(
     x_pixels_per_pulse: float | None = None,
     y_pixels_per_pulse: float | None = None,
     use_overlap_registration: bool = False,
-    compensate_brightness: bool = False,
 ) -> np.ndarray:
     if len(frames) != len(tiles):
         raise ValueError("frames and tiles must have the same length")
@@ -64,9 +61,6 @@ def stitch_tiles_by_stage_coordinates(
         max_right = max(max_right, left + width)
         max_bottom = max(max_bottom, top + height)
 
-    if compensate_brightness:
-        placements = _compensate_placement_brightness(placements, max_bottom, max_right)
-
     channels = 1 if frames[0].ndim == 2 else frames[0].shape[2]
     if channels == 1:
         accumulator = np.zeros((max_bottom, max_right), dtype=np.float64)
@@ -79,65 +73,22 @@ def stitch_tiles_by_stage_coordinates(
         height, width = frame.shape[:2]
         view = accumulator[top : top + height, left : left + width]
         weight_view = weights[top : top + height, left : left + width]
-        view += frame.astype(np.float64)
-        weight_view += 1.0
+        feather = _feather_weights(height, width)
+        if channels != 1:
+            feather = feather[..., None]
+        view += frame.astype(np.float64) * feather
+        weight_view += feather
 
     weights = np.maximum(weights, 1.0)
     mosaic = accumulator / weights
     return np.clip(mosaic, 0, 255).astype(frames[0].dtype)
 
 
-def _compensate_placement_brightness(
-    placements: list[tuple[np.ndarray, int, int]],
-    canvas_height: int,
-    canvas_width: int,
-) -> list[tuple[np.ndarray, int, int]]:
-    """Match tile brightness only where already-placed image content overlaps."""
-    if not placements:
-        return []
-    channels = 1 if placements[0][0].ndim == 2 else placements[0][0].shape[2]
-    if channels == 1:
-        accumulator = np.zeros((canvas_height, canvas_width), dtype=np.float64)
-    else:
-        accumulator = np.zeros((canvas_height, canvas_width, channels), dtype=np.float64)
-    weights = np.zeros((canvas_height, canvas_width), dtype=np.float64)
-    corrected_placements: list[tuple[np.ndarray, int, int]] = []
-
-    for frame, left, top in placements:
-        corrected = frame.astype(np.float64)
-        height, width = frame.shape[:2]
-        weight_view = weights[top : top + height, left : left + width]
-        overlap_mask = weight_view > 0.0
-        if np.any(overlap_mask):
-            accumulator_view = accumulator[top : top + height, left : left + width]
-            if channels == 1:
-                reference = accumulator_view / np.maximum(weight_view, 1.0)
-            else:
-                reference = accumulator_view / np.maximum(weight_view[..., None], 1.0)
-            gain = _estimate_overlap_brightness_gain(reference, corrected, overlap_mask)
-            corrected *= gain
-        corrected_placements.append((corrected, left, top))
-        accumulator[top : top + height, left : left + width] += corrected
-        weight_view += 1.0
-
-    return corrected_placements
-
-
-def _estimate_overlap_brightness_gain(
-    reference: np.ndarray,
-    moving: np.ndarray,
-    overlap_mask: np.ndarray,
-) -> float:
-    reference_gray = _as_gray_float(reference)
-    moving_gray = _as_gray_float(moving)
-    valid = overlap_mask & (reference_gray > 8.0) & (reference_gray < 247.0) & (moving_gray > 8.0) & (moving_gray < 247.0)
-    if int(np.count_nonzero(valid)) < 16:
-        return 1.0
-    ratios = reference_gray[valid] / moving_gray[valid]
-    gain = float(np.median(ratios))
-    if not np.isfinite(gain):
-        return 1.0
-    return float(np.clip(gain, _MIN_BRIGHTNESS_GAIN, _MAX_BRIGHTNESS_GAIN))
+def _feather_weights(height: int, width: int) -> np.ndarray:
+    """Favor tile interiors so overlap transitions do not form hard seams."""
+    x_distance = np.minimum(np.arange(width) + 1, np.arange(width, 0, -1)).astype(np.float64)
+    y_distance = np.minimum(np.arange(height) + 1, np.arange(height, 0, -1)).astype(np.float64)
+    return np.outer(y_distance, x_distance)
 
 
 def refine_tile_positions_by_overlap(
@@ -348,7 +299,6 @@ def stitch_session_by_metadata(
     pixels_per_pulse: float | None = None,
     output_name: str = "stitched_mosaic.png",
     use_overlap_registration: bool = True,
-    compensate_brightness: bool = True,
 ) -> Path:
     try:
         import cv2
@@ -374,7 +324,6 @@ def stitch_session_by_metadata(
         x_pixels_per_pulse=x_scale,
         y_pixels_per_pulse=y_scale,
         use_overlap_registration=use_overlap_registration,
-        compensate_brightness=compensate_brightness,
     )
     output = root / output_name
     ok = bool(cv2.imwrite(str(output), mosaic))

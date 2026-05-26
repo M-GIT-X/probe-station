@@ -62,10 +62,11 @@ MIN_SAMPLE_FRAMES = 3
 DEFAULT_WINDOW_GEOMETRY = "1580x1180"
 MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
-VIDEO_PREVIEW_MAX_WIDTH = 680
-VIDEO_PREVIEW_MAX_HEIGHT = 425
-STITCHING_PLOT_SIZE = VIDEO_PREVIEW_MAX_WIDTH
-AUTOFOCUS_CURVE_WIDTH = VIDEO_PREVIEW_MAX_WIDTH + 20
+VIDEO_PREVIEW_MAX_WIDTH = 760
+VIDEO_PREVIEW_MAX_HEIGHT = 475
+STITCHING_PLOT_SIZE = 555
+AUTOFOCUS_CURVE_WIDTH = 580
+AUTOFOCUS_CURVE_HEIGHT = 130
 PREVIEW_PLACEHOLDER_TEXT = "CAMERA OFFLINE\nAwaiting optical feed"
 PREVIEW_BACKGROUND_COLOR = "#000000"
 CROSSHAIR_COLOR_RGB = (57, 255, 20)
@@ -145,6 +146,9 @@ def mission_log_message_for_event(kind: str, payload: object = None) -> str | No
         "autofocus_completed": "AUTOFOCUS COMPLETE. Final focus position confirmed.",
         "autofocus_stopped": "AUTOFOCUS HOLD. Stop command acknowledged.",
         "autofocus_failed": f"AUTOFOCUS ABORT. Fault received: {text}.",
+        "stitch_scan_completed": "SCAN ACQUISITION COMPLETE. All image tiles secured.",
+        "stitch_assembling": "MOSAIC ASSEMBLY IN PROGRESS. Processing captured tiles.",
+        "stitch_completed": f"MOSAIC COMPLETE. Composite image saved: {text}.",
         "controlled_stop": "CONTROLLED STOP COMMAND SENT. All axes ordered to halt.",
         "emergency_stop": "SOFTWARE EMERGENCY STOP SENT. Verify physical system state immediately.",
     }
@@ -182,6 +186,13 @@ def logical_direction_to_controller_direction(axis: str, logical_sign: int) -> i
     if invert_by_axis.get(axis.upper(), False):
         sign *= -1
     return sign
+
+
+def absolute_delta_to_controller_direction(axis: str, *, current: int, target: int) -> int:
+    """Convert a native controller-position delta directly to its move sign."""
+    del axis
+    delta = int(target) - int(current)
+    return 1 if delta > 0 else -1 if delta < 0 else 0
 
 
 def clamp_manual_motion_params(pulses: int, speed: int) -> tuple[int, int, bool]:
@@ -615,7 +626,7 @@ class ProbeStationApp(tk.Tk):
         self.af_canvas = tk.Canvas(
             self.af_plot_frame,
             width=AUTOFOCUS_CURVE_WIDTH,
-            height=160,
+            height=AUTOFOCUS_CURVE_HEIGHT,
             bg="#101820",
             highlightthickness=0,
         )
@@ -1396,7 +1407,9 @@ class ProbeStationApp(tk.Tk):
                 plane=plane,
                 calibration=calibration,
             )
+            self.device_queue.put(("mission_event", ("stitch_scan_completed", None)))
             self.device_queue.put(("stitch_status", "Progress: assembling stitched mosaic..."))
+            self.device_queue.put(("mission_event", ("stitch_assembling", None)))
             mosaic_path = stitch_session_by_metadata(store.path)
             self.device_queue.put(("stitch_done", (store.path, mosaic_path)))
         except InterruptedError:
@@ -1424,8 +1437,7 @@ class ProbeStationApp(tk.Tk):
             delta = int(target) - current
             if delta == 0:
                 continue
-            direction = 1 if delta > 0 else -1
-            controller_direction = logical_direction_to_controller_direction(axis, direction)
+            controller_direction = absolute_delta_to_controller_direction(axis, current=current, target=target)
             self.controller.move_relative(axis, controller_direction, abs(delta), speed)
             self.absolute_pos[axis] = int(target)
 
@@ -1893,6 +1905,9 @@ class ProbeStationApp(tk.Tk):
                     self._position_poll_running = False
                 elif kind == "status":
                     self._set_status(str(payload))
+                elif kind == "mission_event":
+                    event_kind, event_payload = payload
+                    self._record_mission_event(str(event_kind), event_payload)
                 elif kind == "error":
                     self.recent_error_var.set(f"Recent error: {payload}")
                     self.running_state_var.set("Running state: error")
@@ -1975,6 +1990,7 @@ class ProbeStationApp(tk.Tk):
                         self.stitch_output_var.set(f"Output: {mosaic_path}")
                         self.stitch_progress_var.set("Progress: completed")
                         self._set_status(f"Image stitching completed: {mosaic_path}")
+                        self._record_mission_event("stitch_completed", mosaic_path)
                         messagebox.showinfo(
                             "Image Stitching Completed",
                             f"扫描完成，大图已自动保存：\n{mosaic_path}",

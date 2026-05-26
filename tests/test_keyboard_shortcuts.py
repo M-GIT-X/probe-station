@@ -37,6 +37,20 @@ class KeyboardShortcutTest(unittest.TestCase):
         )
         self.assertIsNone(mission_log_message_for_event("positions", {"X": 1}))
 
+    def test_mission_log_announces_stitching_scan_and_mosaic_lifecycle(self):
+        self.assertEqual(
+            mission_log_message_for_event("stitch_scan_completed"),
+            "SCAN ACQUISITION COMPLETE. All image tiles secured.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("stitch_assembling"),
+            "MOSAIC ASSEMBLY IN PROGRESS. Processing captured tiles.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("stitch_completed", "result.png"),
+            "MOSAIC COMPLETE. Composite image saved: result.png.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

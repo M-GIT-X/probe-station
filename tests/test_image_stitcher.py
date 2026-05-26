@@ -64,7 +64,7 @@ class ImageStitcherTest(unittest.TestCase):
 
         self.assertEqual(result.shape, (40, 80, 3))
 
-    def test_overlap_brightness_compensation_removes_exposure_band_from_neighbor_tile(self):
+    def test_automatic_mosaic_does_not_amplify_fixed_camera_shading(self):
         try:
             import cv2
         except ImportError:
@@ -72,8 +72,10 @@ class ImageStitcherTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            cv2.imwrite(str(root / "left.png"), np.full((30, 50, 3), 120, dtype=np.uint8))
-            cv2.imwrite(str(root / "right.png"), np.full((30, 50, 3), 60, dtype=np.uint8))
+            shading = np.full((30, 50, 3), 80, dtype=np.uint8)
+            shading[:, 20:, :] = 180
+            cv2.imwrite(str(root / "left.png"), shading)
+            cv2.imwrite(str(root / "right.png"), shading)
             metadata = {
                 "tiles": [
                     {"row": 0, "col": 0, "x": 0, "y": 0, "z": 0, "filename": "left.png", "focus_score": 1.0},
@@ -85,7 +87,20 @@ class ImageStitcherTest(unittest.TestCase):
             output = stitch_session_by_metadata(root, pixels_per_pulse=1.0, use_overlap_registration=False)
             mosaic = cv2.imread(str(output))
 
-        self.assertAlmostEqual(float(mosaic[:, :20].mean()), float(mosaic[:, -20:].mean()), delta=2.0)
+        self.assertLessEqual(int(mosaic.max()), 180)
+
+    def test_overlap_blending_feathers_different_tile_brightness_across_join(self):
+        left = np.full((30, 50, 3), 120, dtype=np.uint8)
+        right = np.full((30, 50, 3), 60, dtype=np.uint8)
+        tiles = [
+            TileRecord(row=0, col=0, x=0, y=0, z=0, filename="left.png", focus_score=1.0),
+            TileRecord(row=0, col=1, x=30, y=0, z=0, filename="right.png", focus_score=1.0),
+        ]
+
+        mosaic = stitch_tiles_by_stage_coordinates([left, right], tiles, pixels_per_pulse=1.0)
+        overlap_values = np.unique(mosaic[15, 30:50, 0])
+
+        self.assertGreater(len(overlap_values), 3)
 
     def test_overlap_registration_limits_full_search_work_for_camera_sized_frames(self):
         try:

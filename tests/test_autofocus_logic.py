@@ -15,6 +15,7 @@ from gui_app import (
     clamp_autofocus_params,
     clamp_manual_motion_params,
     logical_direction_to_controller_direction,
+    absolute_delta_to_controller_direction,
     manual_shortcut_mapping,
     select_final_autofocus_point,
 )
@@ -28,6 +29,10 @@ class DirectionMappingTest(unittest.TestCase):
         self.assertEqual(logical_direction_to_controller_direction("Y", -1), +1)
         self.assertEqual(logical_direction_to_controller_direction("Z", +1), +1)
         self.assertEqual(logical_direction_to_controller_direction("Z", -1), -1)
+
+    def test_absolute_position_move_uses_controller_coordinate_sign_without_manual_y_flip(self):
+        self.assertEqual(absolute_delta_to_controller_direction("Y", current=20, target=80), +1)
+        self.assertEqual(absolute_delta_to_controller_direction("Y", current=80, target=20), -1)
 
     def test_manual_xy_shortcuts_follow_operator_direction_feedback(self):
         self.assertEqual(manual_shortcut_mapping("a"), ("X", +1))
