@@ -2,11 +2,17 @@ import unittest
 
 from gui_app import (
     APP_TITLE,
+    AUTOFOCUS_CURVE_WIDTH,
     DEFAULT_WINDOW_GEOMETRY,
+    EMERGENCY_STOP_BACKGROUND_COLOR,
+    EMERGENCY_STOP_FOREGROUND_COLOR,
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
+    MISSION_LOG_BACKGROUND_COLOR,
+    MISSION_LOG_FOREGROUND_COLOR,
     Mode,
     PREVIEW_PLACEHOLDER_TEXT,
+    STITCHING_PLOT_SIZE,
     VIDEO_PREVIEW_MAX_HEIGHT,
     VIDEO_PREVIEW_MAX_WIDTH,
     mode_panel_spec,
@@ -38,12 +44,21 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertIn("Stitched mosaic", stitching.status_fields)
 
     def test_window_and_video_defaults_support_a_larger_primary_preview(self):
-        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1360x900")
+        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1580x1180")
         self.assertLessEqual(MIN_WINDOW_WIDTH, 960)
         self.assertLessEqual(MIN_WINDOW_HEIGHT, 620)
-        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_WIDTH, 640)
-        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_HEIGHT, 400)
+        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_WIDTH, 680)
+        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_HEIGHT, 425)
         self.assertIn("CAMERA OFFLINE", PREVIEW_PLACEHOLDER_TEXT)
+
+    def test_dynamic_view_dimensions_follow_camera_preview_width(self):
+        self.assertEqual(STITCHING_PLOT_SIZE, VIDEO_PREVIEW_MAX_WIDTH)
+        self.assertGreater(AUTOFOCUS_CURVE_WIDTH, VIDEO_PREVIEW_MAX_WIDTH)
+        self.assertLessEqual(AUTOFOCUS_CURVE_WIDTH - VIDEO_PREVIEW_MAX_WIDTH, 24)
+
+    def test_operational_console_and_emergency_button_colors_are_explicit(self):
+        self.assertEqual((MISSION_LOG_BACKGROUND_COLOR, MISSION_LOG_FOREGROUND_COLOR), ("#000000", "#39ff14"))
+        self.assertEqual((EMERGENCY_STOP_BACKGROUND_COLOR, EMERGENCY_STOP_FOREGROUND_COLOR), ("#d45d67", "#ffffff"))
 
     def test_stitching_geometry_only_asks_operator_for_overlap(self):
         self.assertEqual(stitching_geometry_input_fields(), ("Overlap %",))

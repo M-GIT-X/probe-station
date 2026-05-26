@@ -29,9 +29,11 @@ class DirectionMappingTest(unittest.TestCase):
         self.assertEqual(logical_direction_to_controller_direction("Z", +1), +1)
         self.assertEqual(logical_direction_to_controller_direction("Z", -1), -1)
 
-    def test_ad_shortcuts_are_swapped_for_manual_x_control(self):
-        self.assertEqual(manual_shortcut_mapping("a"), ("X", -1))
-        self.assertEqual(manual_shortcut_mapping("d"), ("X", +1))
+    def test_manual_xy_shortcuts_follow_operator_direction_feedback(self):
+        self.assertEqual(manual_shortcut_mapping("a"), ("X", +1))
+        self.assertEqual(manual_shortcut_mapping("d"), ("X", -1))
+        self.assertEqual(manual_shortcut_mapping("w"), ("Y", -1))
+        self.assertEqual(manual_shortcut_mapping("s"), ("Y", +1))
 
 
 class AutofocusLogicTest(unittest.TestCase):

@@ -64,6 +64,29 @@ class ImageStitcherTest(unittest.TestCase):
 
         self.assertEqual(result.shape, (40, 80, 3))
 
+    def test_overlap_brightness_compensation_removes_exposure_band_from_neighbor_tile(self):
+        try:
+            import cv2
+        except ImportError:
+            self.skipTest("OpenCV is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cv2.imwrite(str(root / "left.png"), np.full((30, 50, 3), 120, dtype=np.uint8))
+            cv2.imwrite(str(root / "right.png"), np.full((30, 50, 3), 60, dtype=np.uint8))
+            metadata = {
+                "tiles": [
+                    {"row": 0, "col": 0, "x": 0, "y": 0, "z": 0, "filename": "left.png", "focus_score": 1.0},
+                    {"row": 0, "col": 1, "x": 30, "y": 0, "z": 0, "filename": "right.png", "focus_score": 1.0},
+                ]
+            }
+            (root / "metadata.json").write_text(__import__("json").dumps(metadata), encoding="utf-8")
+
+            output = stitch_session_by_metadata(root, pixels_per_pulse=1.0, use_overlap_registration=False)
+            mosaic = cv2.imread(str(output))
+
+        self.assertAlmostEqual(float(mosaic[:, :20].mean()), float(mosaic[:, -20:].mean()), delta=2.0)
+
     def test_overlap_registration_limits_full_search_work_for_camera_sized_frames(self):
         try:
             import cv2  # noqa: F401

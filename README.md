@@ -62,8 +62,8 @@ Use the top mode drop-down to switch between:
 
 ## Shortcuts
 
-- `A` / `D` = X- / X+
-- `W` / `S` = Y+ / Y-
+- `A` / `D` = X+ / X-
+- `W` / `S` = Y- / Y+
 - `Q` / `E` = Z- / Z+
 - `Space` = all-axis decelerated stop
 - `Esc` = software emergency stop
@@ -117,6 +117,11 @@ little texture for reliable matching, it falls back to the stage-coordinate
 placement instead of forcing a bad correction. Each tile is sampled multiple
 times and the clearest acceptable frame is saved, which helps while the
 temporary setup is still vibration-prone.
+
+During automatic mosaic generation, neighboring tile overlaps are also used to
+estimate gentle brightness compensation. This reduces alternating bright/dark
+bands caused by capture exposure variation without independently normalizing
+away real sample contrast.
 
 The dynamic display below the shared camera preview outlines the planned scan
 grid in green and fills each captured tile area as scanning progresses.

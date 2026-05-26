@@ -59,14 +59,20 @@ SAFE_MAX_AUTOFOCUS_RANGE = 2000
 SAFE_MAX_AUTOFOCUS_STEP = 2000
 SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
-DEFAULT_WINDOW_GEOMETRY = "1360x900"
+DEFAULT_WINDOW_GEOMETRY = "1580x1180"
 MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
-VIDEO_PREVIEW_MAX_WIDTH = 640
-VIDEO_PREVIEW_MAX_HEIGHT = 400
+VIDEO_PREVIEW_MAX_WIDTH = 680
+VIDEO_PREVIEW_MAX_HEIGHT = 425
+STITCHING_PLOT_SIZE = VIDEO_PREVIEW_MAX_WIDTH
+AUTOFOCUS_CURVE_WIDTH = VIDEO_PREVIEW_MAX_WIDTH + 20
 PREVIEW_PLACEHOLDER_TEXT = "CAMERA OFFLINE\nAwaiting optical feed"
 PREVIEW_BACKGROUND_COLOR = "#000000"
 CROSSHAIR_COLOR_RGB = (57, 255, 20)
+MISSION_LOG_BACKGROUND_COLOR = "#000000"
+MISSION_LOG_FOREGROUND_COLOR = "#39ff14"
+EMERGENCY_STOP_BACKGROUND_COLOR = "#d45d67"
+EMERGENCY_STOP_FOREGROUND_COLOR = "#ffffff"
 
 
 def list_serial_port_names() -> list[str]:
@@ -147,10 +153,10 @@ def mission_log_message_for_event(kind: str, payload: object = None) -> str | No
 
 def manual_shortcut_mapping(key: str) -> tuple[str, int] | None:
     mapping = {
-        "a": ("X", -1),
-        "d": ("X", +1),
-        "w": ("Y", +1),
-        "s": ("Y", -1),
+        "a": ("X", +1),
+        "d": ("X", -1),
+        "w": ("Y", -1),
+        "s": ("Y", +1),
         "q": ("Z", -1),
         "e": ("Z", +1),
     }
@@ -507,14 +513,15 @@ class ProbeStationApp(tk.Tk):
 
         body = ttk.Frame(self, padding=(10, 0, 10, 10))
         body.grid(row=1, column=0, sticky="nsew")
-        body.columnconfigure(1, weight=1, minsize=430)
+        body.columnconfigure(0, minsize=320)
+        body.columnconfigure(1, weight=1, minsize=AUTOFOCUS_CURVE_WIDTH + 12)
+        body.columnconfigure(2, minsize=360)
         body.rowconfigure(0, weight=1)
         left = ttk.Frame(body, padding=(0, 0, 10, 0))
         left.grid(row=0, column=0, sticky="ns")
         center = ttk.Frame(body)
         center.grid(row=0, column=1, sticky="nsew")
         center.columnconfigure(0, weight=1)
-        center.rowconfigure(4, weight=1)
         right = ttk.Frame(body, padding=(10, 0, 0, 0))
         right.grid(row=0, column=2, sticky="ns")
         right.columnconfigure(0, weight=1)
@@ -548,10 +555,10 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(move, text="Speed %").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(move, textvariable=self.speed_var, width=8).grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
         self.manual_move_buttons = [
-            ttk.Button(move, text="Y+  W", command=lambda: self._move("Y", +1)),
-            ttk.Button(move, text="X-  A", command=lambda: self._move("X", -1)),
-            ttk.Button(move, text="X+  D", command=lambda: self._move("X", +1)),
-            ttk.Button(move, text="Y-  S", command=lambda: self._move("Y", -1)),
+            ttk.Button(move, text="Y-  W", command=lambda: self._move("Y", -1)),
+            ttk.Button(move, text="X+  A", command=lambda: self._move("X", +1)),
+            ttk.Button(move, text="X-  D", command=lambda: self._move("X", -1)),
+            ttk.Button(move, text="Y+  S", command=lambda: self._move("Y", +1)),
             ttk.Button(move, text="Z-  Q", command=lambda: self._move("Z", -1)),
             ttk.Button(move, text="Z+  E", command=lambda: self._move("Z", +1)),
         ]
@@ -562,9 +569,31 @@ class ProbeStationApp(tk.Tk):
         self.manual_move_buttons[3].grid(row=4, column=1, sticky="ew", pady=2)
         self.manual_move_buttons[4].grid(row=5, column=0, sticky="ew", padx=2, pady=(10, 2))
         self.manual_move_buttons[5].grid(row=5, column=2, sticky="ew", padx=2, pady=(10, 2))
-        ttk.Button(move, text="Software Emergency Stop  Esc", command=self._emergency_stop).grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        self.emergency_stop_button = tk.Button(
+            move,
+            text="Software Emergency Stop  Esc",
+            command=self._emergency_stop,
+            bg=EMERGENCY_STOP_BACKGROUND_COLOR,
+            fg=EMERGENCY_STOP_FOREGROUND_COLOR,
+            activebackground="#bb4550",
+            activeforeground=EMERGENCY_STOP_FOREGROUND_COLOR,
+            relief="raised",
+        )
+        self.emergency_stop_button.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
         self.software_origin_button = ttk.Button(move, text="Set Software Origin", command=self._set_software_origin)
         self.software_origin_button.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+
+        self.focus_info_panel = ttk.LabelFrame(left, text="Sharpness / Image Status", padding=8)
+        focus_info = self.focus_info_panel
+        focus_info.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for variable in [self.focus_var, self.brightness_var, self.saturation_var, self.underexposed_var, self.exposure_warning_var]:
+            ttk.Label(focus_info, textvariable=variable).pack(anchor="w")
+
+        self.position_activity_panel = ttk.LabelFrame(left, text="Position / Activity", padding=8)
+        pos = self.position_activity_panel
+        pos.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        for variable in [self.abs_pos_var, self.rel_pos_var, self.recent_command_var, self.recent_feedback_var, self.recent_error_var]:
+            ttk.Label(pos, textvariable=variable, wraplength=300).pack(anchor="w")
 
         video_frame = ttk.LabelFrame(center, text="Camera Preview", padding=4)
         video_frame.grid(row=0, column=0, sticky="n", pady=(0, 8))
@@ -582,41 +611,27 @@ class ProbeStationApp(tk.Tk):
         self._show_camera_placeholder()
 
         self.af_plot_frame = ttk.LabelFrame(center, text="Autofocus Curve", padding=4)
-        self.af_plot_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        self.af_canvas = tk.Canvas(self.af_plot_frame, height=120, bg="#101820", highlightthickness=0)
-        self.af_canvas.grid(row=0, column=0, sticky="ew")
-        self.af_plot_frame.columnconfigure(0, weight=1)
+        self.af_plot_frame.grid(row=1, column=0, sticky="n", pady=(0, 8))
+        self.af_canvas = tk.Canvas(
+            self.af_plot_frame,
+            width=AUTOFOCUS_CURVE_WIDTH,
+            height=160,
+            bg="#101820",
+            highlightthickness=0,
+        )
+        self.af_canvas.grid(row=0, column=0)
 
         self.stitch_plot_frame = ttk.LabelFrame(center, text="Stitching Plane / Progress", padding=4)
-        self.stitch_plot_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        self.stitch_plane_canvas = tk.Canvas(self.stitch_plot_frame, height=160, bg="#101820", highlightthickness=0)
-        self.stitch_plane_canvas.grid(row=0, column=0, sticky="ew")
-        self.stitch_plot_frame.columnconfigure(0, weight=1)
+        self.stitch_plot_frame.grid(row=1, column=0, sticky="n", pady=(0, 8))
+        self.stitch_plane_canvas = tk.Canvas(
+            self.stitch_plot_frame,
+            width=STITCHING_PLOT_SIZE,
+            height=STITCHING_PLOT_SIZE,
+            bg="#101820",
+            highlightthickness=0,
+        )
+        self.stitch_plane_canvas.grid(row=0, column=0)
         self._draw_stitching_plane_view()
-
-        focus_info = ttk.LabelFrame(center, text="Sharpness / Image Status", padding=8)
-        focus_info.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        for col in range(2):
-            focus_info.columnconfigure(col, weight=1)
-        for index, variable in enumerate(
-            [self.focus_var, self.brightness_var, self.saturation_var, self.underexposed_var, self.exposure_warning_var]
-        ):
-            ttk.Label(focus_info, textvariable=variable).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 10))
-
-        pos = ttk.LabelFrame(center, text="Position / Activity", padding=8)
-        pos.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        for row, variable in enumerate(
-            [self.abs_pos_var, self.rel_pos_var, self.recent_command_var, self.recent_feedback_var, self.recent_error_var]
-        ):
-            ttk.Label(pos, textvariable=variable).grid(row=row, column=0, sticky="w")
-
-        mission = ttk.LabelFrame(center, text="Mission Log", padding=8)
-        mission.grid(row=4, column=0, sticky="nsew")
-        mission.columnconfigure(0, weight=1)
-        self.mission_log_text = tk.Text(mission, height=5, width=54, wrap="word", state="disabled")
-        self.mission_log_text.grid(row=0, column=0, sticky="nsew")
-        ttk.Label(mission, textvariable=self.status_var, wraplength=500, foreground="#8a4b00").grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        self._append_mission_log("SYSTEM READY. Awaiting operator command.")
 
         if self.enable_autofocus:
             self.autofocus_panel = ttk.LabelFrame(right, text="Auto Focus Controls", padding=8)
@@ -673,8 +688,28 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=10, column=0, columnspan=4, sticky="w")
 
+        self.mission_panel = ttk.LabelFrame(right, text="Mission Log", padding=8)
+        mission = self.mission_panel
+        mission.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        mission.columnconfigure(0, weight=1)
+        self.mission_log_text = tk.Text(
+            mission,
+            height=9,
+            width=44,
+            wrap="word",
+            state="disabled",
+            bg=MISSION_LOG_BACKGROUND_COLOR,
+            fg=MISSION_LOG_FOREGROUND_COLOR,
+            insertbackground=MISSION_LOG_FOREGROUND_COLOR,
+            selectbackground="#145c22",
+            relief="flat",
+        )
+        self.mission_log_text.grid(row=0, column=0, sticky="ew")
+        ttk.Label(mission, textvariable=self.status_var, wraplength=350, foreground="#8a4b00").grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._append_mission_log("SYSTEM READY. Awaiting operator command.")
+
         camera_controls = ttk.LabelFrame(right, text="Camera Controls", padding=8)
-        camera_controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        camera_controls.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         for col in range(4):
             camera_controls.columnconfigure(col, weight=1)
         ttk.Button(camera_controls, text="Read Properties", command=self._read_camera_properties).grid(row=0, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
@@ -1111,8 +1146,8 @@ class ProbeStationApp(tk.Tk):
         if canvas is None:
             return
         canvas.delete("all")
-        width = max(10, canvas.winfo_width() or 320)
-        height = max(10, canvas.winfo_height() or 180)
+        width = max(10, canvas.winfo_width(), int(float(canvas.cget("width"))))
+        height = max(10, canvas.winfo_height(), int(float(canvas.cget("height"))))
         margin = 18
         canvas.create_rectangle(0, 0, width, height, fill="#06110d", outline="")
         corners = self.stitching.corners or []
