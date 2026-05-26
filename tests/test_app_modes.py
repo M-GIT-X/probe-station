@@ -53,7 +53,7 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertIn("CAMERA OFFLINE", PREVIEW_PLACEHOLDER_TEXT)
 
     def test_dynamic_view_footprints_are_smaller_than_the_primary_preview(self):
-        self.assertEqual(STITCHING_PLOT_SIZE, 555)
+        self.assertEqual(STITCHING_PLOT_SIZE, 370)
         self.assertEqual((AUTOFOCUS_CURVE_WIDTH, AUTOFOCUS_CURVE_HEIGHT), (580, 130))
         self.assertLess(STITCHING_PLOT_SIZE, VIDEO_PREVIEW_MAX_WIDTH)
         self.assertLess(AUTOFOCUS_CURVE_WIDTH, VIDEO_PREVIEW_MAX_WIDTH)

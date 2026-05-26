@@ -55,7 +55,7 @@ INVERT_Z_DIRECTION = False
 SAFE_MODE = True
 SAFE_MAX_MANUAL_STEP = 2000
 SAFE_MAX_MANUAL_SPEED = 100
-SAFE_MAX_AUTOFOCUS_RANGE = 2000
+SAFE_MAX_AUTOFOCUS_RANGE = 5000
 SAFE_MAX_AUTOFOCUS_STEP = 2000
 SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
@@ -64,7 +64,7 @@ MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
 VIDEO_PREVIEW_MAX_WIDTH = 760
 VIDEO_PREVIEW_MAX_HEIGHT = 475
-STITCHING_PLOT_SIZE = 555
+STITCHING_PLOT_SIZE = 370
 AUTOFOCUS_CURVE_WIDTH = 580
 AUTOFOCUS_CURVE_HEIGHT = 130
 PREVIEW_PLACEHOLDER_TEXT = "CAMERA OFFLINE\nAwaiting optical feed"
@@ -1369,8 +1369,6 @@ class ProbeStationApp(tk.Tk):
                 overlap_percent=overlap_percent,
                 boundary_points=boundary_points,
             )
-            if len(plan.tiles) > 100:
-                raise RuntimeError(f"automatic plan requires {len(plan.tiles)} tiles; first safe version is limited to 100")
             tiles = plan.tiles
             self.device_queue.put(("stitch_plan", (calibration, plan)))
             for index, tile in enumerate(tiles, start=1):

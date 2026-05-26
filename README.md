@@ -155,8 +155,7 @@ warning and lets the user cancel or continue.
 - Auto Focus only moves Z.
 - Image Stitching moves X/Y/Z automatically inside the recorded four-corner
   polygon. It requires exactly four recorded corners, keeps calibration trial
-  locations inside the polygon, and limits the first version to at most 100
-  automatically planned tiles.
+  locations inside the polygon, and does not impose a fixed tile-count limit.
 - Press `Space`, `Esc`, or the physical emergency stop immediately if anything
   looks unsafe.
 
@@ -164,7 +163,7 @@ warning and lets the user cancel or continue.
 
 - `SAFE_MAX_MANUAL_STEP = 2000`
 - `SAFE_MAX_MANUAL_SPEED = 100`
-- `SAFE_MAX_AUTOFOCUS_RANGE = 2000`
+- `SAFE_MAX_AUTOFOCUS_RANGE = 5000`
 - `SAFE_MAX_AUTOFOCUS_STEP = 2000`
 - `SAFE_MAX_AUTOFOCUS_SPEED = 100`
 

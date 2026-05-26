@@ -51,7 +51,7 @@ class AutofocusLogicTest(unittest.TestCase):
         self.assertEqual(SAFE_MAX_MANUAL_STEP, 2000)
         self.assertEqual(SAFE_MAX_MANUAL_SPEED, 100)
 
-    def test_safe_mode_allows_autofocus_range_step_up_to_2000_and_full_protocol_speed(self):
+    def test_safe_mode_allows_autofocus_range_up_to_5000_and_full_protocol_speed(self):
         params = AutofocusParams(
             scan_range=5000,
             scan_step=5000,
@@ -67,7 +67,7 @@ class AutofocusLogicTest(unittest.TestCase):
         self.assertEqual(clamped.scan_range, SAFE_MAX_AUTOFOCUS_RANGE)
         self.assertEqual(clamped.scan_step, SAFE_MAX_AUTOFOCUS_STEP)
         self.assertEqual(clamped.autofocus_speed, SAFE_MAX_AUTOFOCUS_SPEED)
-        self.assertEqual(SAFE_MAX_AUTOFOCUS_RANGE, 2000)
+        self.assertEqual(SAFE_MAX_AUTOFOCUS_RANGE, 5000)
         self.assertEqual(SAFE_MAX_AUTOFOCUS_STEP, 2000)
         self.assertEqual(SAFE_MAX_AUTOFOCUS_SPEED, 100)
 
