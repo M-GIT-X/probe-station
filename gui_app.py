@@ -61,11 +61,15 @@ SAFE_MAX_AUTOFOCUS_RANGE = 5000
 SAFE_MAX_AUTOFOCUS_STEP = 2000
 SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
-DEFAULT_WINDOW_GEOMETRY = "1840x1180"
+DEFAULT_WINDOW_GEOMETRY = "1400x900"
 MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
 VIDEO_PREVIEW_MAX_WIDTH = 1013
 VIDEO_PREVIEW_MAX_HEIGHT = 633
+LEFT_PANEL_MIN_WIDTH = 320
+RIGHT_PANEL_MIN_WIDTH = 360
+CENTER_PANEL_MIN_WIDTH = VIDEO_PREVIEW_MAX_WIDTH + 12
+BODY_HORIZONTAL_PADDING = 20
 STITCHING_PLOT_SIZE = 370
 STITCH_PREVIEW_SAMPLE_TARGET = 800
 LARGE_STITCH_REDRAW_TILE_INTERVAL = 10
@@ -254,6 +258,23 @@ class ModePanelSpec:
     primary_actions: tuple[str, ...]
     status_fields: tuple[str, ...]
     message: str
+
+
+@dataclass(frozen=True)
+class ScrollableBodyLayoutSpec:
+    vertical_scrollbar: bool
+    horizontal_scrollbar: bool
+    min_window_size: tuple[int, int]
+    content_min_width: int
+
+
+def scrollable_body_layout_spec() -> ScrollableBodyLayoutSpec:
+    return ScrollableBodyLayoutSpec(
+        vertical_scrollbar=True,
+        horizontal_scrollbar=True,
+        min_window_size=(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT),
+        content_min_width=LEFT_PANEL_MIN_WIDTH + CENTER_PANEL_MIN_WIDTH + RIGHT_PANEL_MIN_WIDTH + BODY_HORIZONTAL_PADDING,
+    )
 
 
 def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
@@ -594,11 +615,31 @@ class ProbeStationApp(tk.Tk):
         ttk.Label(top, textvariable=self.current_mode_var, foreground="#005a8d").grid(row=0, column=3, sticky="w")
         ttk.Label(top, textvariable=self.running_state_var).grid(row=0, column=4, sticky="e")
 
-        body = ttk.Frame(self, padding=(10, 0, 10, 10))
-        body.grid(row=1, column=0, sticky="nsew")
-        body.columnconfigure(0, minsize=320)
-        body.columnconfigure(1, weight=1, minsize=VIDEO_PREVIEW_MAX_WIDTH + 12)
-        body.columnconfigure(2, minsize=360)
+        body_viewport = ttk.Frame(self, padding=(10, 0, 10, 10))
+        body_viewport.grid(row=1, column=0, sticky="nsew")
+        body_viewport.rowconfigure(0, weight=1)
+        body_viewport.columnconfigure(0, weight=1)
+        self.body_canvas = tk.Canvas(body_viewport, highlightthickness=0, borderwidth=0)
+        self.body_v_scrollbar = ttk.Scrollbar(body_viewport, orient="vertical", command=self.body_canvas.yview)
+        self.body_h_scrollbar = ttk.Scrollbar(body_viewport, orient="horizontal", command=self.body_canvas.xview)
+        self.body_canvas.configure(
+            yscrollcommand=self.body_v_scrollbar.set,
+            xscrollcommand=self.body_h_scrollbar.set,
+        )
+        self.body_canvas.grid(row=0, column=0, sticky="nsew")
+        self.body_v_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.body_h_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        body = ttk.Frame(self.body_canvas)
+        self.body_frame = body
+        self._body_window_id = self.body_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", self._update_body_scrollregion)
+        self.body_canvas.bind("<Configure>", self._resize_body_canvas_window)
+        self.body_canvas.bind("<Enter>", self._bind_body_mousewheel)
+        self.body_canvas.bind("<Leave>", self._unbind_body_mousewheel)
+        body.columnconfigure(0, minsize=LEFT_PANEL_MIN_WIDTH)
+        body.columnconfigure(1, weight=1, minsize=CENTER_PANEL_MIN_WIDTH)
+        body.columnconfigure(2, minsize=RIGHT_PANEL_MIN_WIDTH)
         body.rowconfigure(0, weight=1)
         left = ttk.Frame(body, padding=(0, 0, 10, 0))
         left.grid(row=0, column=0, sticky="ns")
@@ -828,6 +869,41 @@ class ProbeStationApp(tk.Tk):
 
         self._on_autofocus_mode_change()
         self._apply_mode_layout()
+
+    def _update_body_scrollregion(self, _event=None) -> None:
+        self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all"))
+
+    def _resize_body_canvas_window(self, event) -> None:
+        requested_width = self.body_frame.winfo_reqwidth()
+        self.body_canvas.itemconfigure(self._body_window_id, width=max(event.width, requested_width))
+        self._update_body_scrollregion()
+
+    def _bind_body_mousewheel(self, _event) -> None:
+        self.body_canvas.bind_all("<MouseWheel>", self._on_body_mousewheel)
+        self.body_canvas.bind_all("<Shift-MouseWheel>", self._on_body_shift_mousewheel)
+        self.body_canvas.bind_all("<Button-4>", self._on_body_mousewheel)
+        self.body_canvas.bind_all("<Button-5>", self._on_body_mousewheel)
+
+    def _unbind_body_mousewheel(self, _event) -> None:
+        self.body_canvas.unbind_all("<MouseWheel>")
+        self.body_canvas.unbind_all("<Shift-MouseWheel>")
+        self.body_canvas.unbind_all("<Button-4>")
+        self.body_canvas.unbind_all("<Button-5>")
+
+    def _on_body_mousewheel(self, event) -> str:
+        if getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            units = -1 if event.delta > 0 else 1
+        self.body_canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _on_body_shift_mousewheel(self, event) -> str:
+        units = -1 if event.delta > 0 else 1
+        self.body_canvas.xview_scroll(units, "units")
+        return "break"
 
     def _bind_keys(self) -> None:
         for key in ("a", "d", "w", "s", "q", "e"):

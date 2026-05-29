@@ -17,6 +17,7 @@ from gui_app import (
     VIDEO_PREVIEW_MAX_HEIGHT,
     VIDEO_PREVIEW_MAX_WIDTH,
     mode_panel_spec,
+    scrollable_body_layout_spec,
     stitching_geometry_input_fields,
 )
 
@@ -45,11 +46,19 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertIn("Stitched mosaic", stitching.status_fields)
 
     def test_window_and_video_defaults_support_a_larger_primary_preview(self):
-        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1840x1180")
+        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1400x900")
         self.assertLessEqual(MIN_WINDOW_WIDTH, 960)
         self.assertLessEqual(MIN_WINDOW_HEIGHT, 620)
         self.assertEqual((VIDEO_PREVIEW_MAX_WIDTH, VIDEO_PREVIEW_MAX_HEIGHT), (1013, 633))
         self.assertIn("CAMERA OFFLINE", PREVIEW_PLACEHOLDER_TEXT)
+
+    def test_main_work_area_is_scrollable_when_window_is_small(self):
+        spec = scrollable_body_layout_spec()
+
+        self.assertTrue(spec.vertical_scrollbar)
+        self.assertTrue(spec.horizontal_scrollbar)
+        self.assertEqual(spec.min_window_size, (MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT))
+        self.assertGreater(spec.content_min_width, MIN_WINDOW_WIDTH)
 
     def test_dynamic_view_footprints_are_smaller_than_the_primary_preview(self):
         self.assertEqual(STITCHING_PLOT_SIZE, 370)
