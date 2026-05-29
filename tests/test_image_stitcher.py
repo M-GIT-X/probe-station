@@ -1,11 +1,13 @@
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
 import image_stitcher
 from image_stitcher import (
+    IncrementalMosaicBuilder,
     refine_tile_positions_by_overlap,
     stitch_session_by_metadata,
     stitch_tiles_by_stage_coordinates,
@@ -221,6 +223,66 @@ class ImageStitcherTest(unittest.TestCase):
 
             mosaic = cv2.imread(str(output))
             self.assertEqual(mosaic.shape, (20, 50, 3))
+
+    def test_incremental_mosaic_builder_matches_coordinate_stitcher_output(self):
+        frames = [
+            np.full((20, 30, 3), 60, dtype=np.uint8),
+            np.full((20, 30, 3), 120, dtype=np.uint8),
+            np.full((20, 30, 3), 180, dtype=np.uint8),
+        ]
+        tiles = [
+            TileRecord(row=0, col=0, x=0, y=0, z=0, filename="tile_0.png", focus_score=1.0),
+            TileRecord(row=0, col=1, x=20, y=0, z=0, filename="tile_1.png", focus_score=1.0),
+            TileRecord(row=0, col=2, x=40, y=0, z=0, filename="tile_2.png", focus_score=1.0),
+        ]
+
+        expected = stitch_tiles_by_stage_coordinates(frames, tiles, pixels_per_pulse=1.0)
+        builder = IncrementalMosaicBuilder(tiles, frames[0].shape, pixels_per_pulse=1.0)
+        try:
+            for index, frame in enumerate(frames):
+                builder.add_tile(index, frame)
+            actual = builder.to_array()
+        finally:
+            builder.close()
+
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_large_session_uses_streaming_coordinate_stitcher(self):
+        try:
+            import cv2
+        except ImportError:
+            self.skipTest("OpenCV is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            frame = np.zeros((12, 16, 3), dtype=np.uint8)
+            frame[:, :, 1] = 90
+            for index in range(3):
+                cv2.imwrite(str(root / f"tile_{index}.png"), frame + index)
+            metadata = {
+                "calibration": {"x_pixels_per_pulse": 1.0, "y_pixels_per_pulse": 1.0},
+                "tiles": [
+                    {"row": 0, "col": 0, "x": 0, "y": 0, "z": 0, "filename": "tile_0.png", "focus_score": 1.0},
+                    {"row": 0, "col": 1, "x": 12, "y": 0, "z": 0, "filename": "tile_1.png", "focus_score": 1.0},
+                    {"row": 0, "col": 2, "x": 24, "y": 0, "z": 0, "filename": "tile_2.png", "focus_score": 1.0},
+                ],
+            }
+            (root / "metadata.json").write_text(__import__("json").dumps(metadata), encoding="utf-8")
+
+            original = image_stitcher.stitch_tiles_by_stage_coordinates
+            try:
+                image_stitcher.stitch_tiles_by_stage_coordinates = Mock(side_effect=AssertionError("in-memory path used"))
+                output = stitch_session_by_metadata(
+                    root,
+                    stream_after_tile_count=2,
+                    stream_after_mosaic_pixels=1_000_000,
+                )
+            finally:
+                image_stitcher.stitch_tiles_by_stage_coordinates = original
+
+            mosaic = cv2.imread(str(output))
+            self.assertEqual(mosaic.shape, (12, 40, 3))
+            self.assertEqual(int(mosaic[4, 4, 1]), 90)
 
 
 if __name__ == "__main__":

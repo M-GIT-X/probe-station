@@ -17,6 +17,7 @@ from gui_app import (
     logical_direction_to_controller_direction,
     absolute_delta_to_controller_direction,
     manual_shortcut_mapping,
+    should_release_numeric_entry_focus,
     select_final_autofocus_point,
 )
 
@@ -42,6 +43,9 @@ class DirectionMappingTest(unittest.TestCase):
 
 
 class AutofocusLogicTest(unittest.TestCase):
+    def test_autofocus_params_default_speed_is_90_percent(self):
+        self.assertEqual(AutofocusParams().autofocus_speed, 90)
+
     def test_safe_mode_allows_manual_motion_up_to_2000_pulses_and_full_protocol_speed(self):
         pulses, speed, changed = clamp_manual_motion_params(5000, 200)
 
@@ -94,7 +98,15 @@ class AutofocusLogicTest(unittest.TestCase):
         self.assertEqual(passes[0].scan_range, 80)
         self.assertLess(passes[-1].scan_range, passes[0].scan_range)
         self.assertEqual(passes[1].scan_step, max(1, passes[0].scan_step // 2))
-        self.assertEqual(passes[2].scan_step, max(1, passes[1].scan_step // 2))
+        self.assertLess(passes[2].scan_step, passes[1].scan_step)
+
+    def test_full_auto_finishes_with_one_pulse_precision(self):
+        params = AutofocusParams(scan_range=80, scan_step=99)
+
+        passes = build_autofocus_pass_plan(params, AutofocusMode.FULL)
+
+        self.assertEqual(passes[-1].scan_step, 1)
+        self.assertEqual(passes[-1].name, "fine")
 
     def test_final_point_prefers_stability_inside_near_best_band(self):
         points = [
@@ -116,6 +128,14 @@ class AutofocusLogicTest(unittest.TestCase):
         selected = select_final_autofocus_point(points, near_best_ratio=0.96)
 
         self.assertEqual(selected.offset, 3)
+
+class NumericEntryFocusTest(unittest.TestCase):
+    def test_numeric_entry_releases_focus_for_non_numeric_printable_key(self):
+        self.assertTrue(should_release_numeric_entry_focus("x", "x"))
+        self.assertFalse(should_release_numeric_entry_focus("5", "5"))
+        self.assertFalse(should_release_numeric_entry_focus(".", "."))
+        self.assertFalse(should_release_numeric_entry_focus("", "BackSpace"))
+        self.assertFalse(should_release_numeric_entry_focus("", "Return"))
 
 
 if __name__ == "__main__":

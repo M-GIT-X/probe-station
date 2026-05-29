@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
+import math
 from pathlib import Path
 import sys
 import queue
@@ -23,7 +25,7 @@ from focus_metrics import (
     robust_representative,
     stabilize_frame_translation,
 )
-from image_stitcher import stitch_session_by_metadata
+from image_stitcher import IncrementalMosaicBuilder, stitch_session_by_metadata
 from sample_plane import SamplePlanePoint, boundary_polygon_from_points, bounds_from_plane_points, fit_sample_plane
 from scan_plan import TilePoint, generate_overlap_scan_plan
 from stage_controller import StageController
@@ -59,12 +61,15 @@ SAFE_MAX_AUTOFOCUS_RANGE = 5000
 SAFE_MAX_AUTOFOCUS_STEP = 2000
 SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
-DEFAULT_WINDOW_GEOMETRY = "1580x1180"
+DEFAULT_WINDOW_GEOMETRY = "1840x1180"
 MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
-VIDEO_PREVIEW_MAX_WIDTH = 760
-VIDEO_PREVIEW_MAX_HEIGHT = 475
+VIDEO_PREVIEW_MAX_WIDTH = 1013
+VIDEO_PREVIEW_MAX_HEIGHT = 633
 STITCHING_PLOT_SIZE = 370
+STITCH_PREVIEW_SAMPLE_TARGET = 800
+LARGE_STITCH_REDRAW_TILE_INTERVAL = 10
+LARGE_STITCH_REDRAW_SECONDS = 0.5
 AUTOFOCUS_CURVE_WIDTH = 580
 AUTOFOCUS_CURVE_HEIGHT = 130
 PREVIEW_PLACEHOLDER_TEXT = "CAMERA OFFLINE\nAwaiting optical feed"
@@ -130,6 +135,14 @@ def should_ignore_axis_shortcut(widget) -> bool:
     return widget_class in {"Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox"}
 
 
+def should_release_numeric_entry_focus(char: str, keysym: str) -> bool:
+    if keysym in {"BackSpace", "Delete", "Left", "Right", "Home", "End", "Tab", "Return", "KP_Enter"}:
+        return False
+    if char == "":
+        return False
+    return not (char.isdigit() or char in {".", "-"})
+
+
 def should_return_focus_to_root_on_enter(widget) -> bool:
     return should_ignore_axis_shortcut(widget)
 
@@ -167,13 +180,43 @@ def manual_shortcut_mapping(key: str) -> tuple[str, int] | None:
     return mapping.get(key.lower())
 
 
-def draw_preview_crosshair(rgb_frame: np.ndarray) -> np.ndarray:
+def draw_preview_crosshair(
+    rgb_frame: np.ndarray,
+    *,
+    cursor_position: tuple[int, int] | None = None,
+    include_center: bool = True,
+    cursor_radius: int = 8,
+) -> np.ndarray:
     overlaid = rgb_frame.copy()
-    center_y = overlaid.shape[0] // 2
-    center_x = overlaid.shape[1] // 2
-    overlaid[center_y, :, :3] = CROSSHAIR_COLOR_RGB
-    overlaid[:, center_x, :3] = CROSSHAIR_COLOR_RGB
+    if include_center:
+        center_y = overlaid.shape[0] // 2
+        center_x = overlaid.shape[1] // 2
+        overlaid[center_y, :, :3] = CROSSHAIR_COLOR_RGB
+        overlaid[:, center_x, :3] = CROSSHAIR_COLOR_RGB
+    if cursor_position is not None:
+        cursor_x, cursor_y = cursor_position
+        if 0 <= cursor_x < overlaid.shape[1] and 0 <= cursor_y < overlaid.shape[0]:
+            radius = max(1, int(cursor_radius))
+            left = max(0, cursor_x - radius)
+            right = min(overlaid.shape[1], cursor_x + radius + 1)
+            top = max(0, cursor_y - radius)
+            bottom = min(overlaid.shape[0], cursor_y + radius + 1)
+            overlaid[cursor_y, left:right, :3] = CROSSHAIR_COLOR_RGB
+            overlaid[top:bottom, cursor_x, :3] = CROSSHAIR_COLOR_RGB
     return overlaid
+
+
+def stage_delta_from_preview_delta(
+    dx_pixels: float,
+    dy_pixels: float,
+    calibration: StitchingCalibration,
+) -> tuple[int, int]:
+    if calibration.x_pixels_per_pulse == 0.0 or calibration.y_pixels_per_pulse == 0.0:
+        raise ValueError("pixel-per-pulse calibration must be non-zero")
+    return (
+        int(round(float(dx_pixels) / calibration.x_pixels_per_pulse)),
+        int(round(float(dy_pixels) / calibration.y_pixels_per_pulse)),
+    )
 
 
 def logical_direction_to_controller_direction(axis: str, logical_sign: int) -> int:
@@ -226,8 +269,8 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
         return ModePanelSpec(
             visible_sections=("image_stitching",),
             primary_actions=("Record Corner", "Delete Last Corner", "Start Stitching Scan"),
-            status_fields=("Corner count", "Sample plane residual", "Tile progress", "Stitched mosaic"),
-            message="Image Stitching: manually focus and record four corners, then scan tiles with Z plane compensation.",
+            status_fields=("Corner count", "Sample plane fit", "Tile progress", "Stitched mosaic"),
+            message="Image Stitching: record four XY corners; scan start refocuses corners and fits the Z plane.",
         )
     return ModePanelSpec(
         visible_sections=("manual",),
@@ -240,11 +283,33 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
 def stitching_geometry_input_fields() -> tuple[str, ...]:
     return ("Overlap %",)
 
+
+def preview_tile_draw_indices(
+    total_tiles: int,
+    *,
+    current_tile_index: int | None = None,
+    captured_tile_count: int = 0,
+    sample_target: int = STITCH_PREVIEW_SAMPLE_TARGET,
+) -> set[int]:
+    total_tiles = max(0, int(total_tiles))
+    if total_tiles <= sample_target:
+        return set(range(total_tiles))
+    stride = max(1, math.ceil(total_tiles / sample_target))
+    indices = set(range(0, total_tiles, stride))
+    if current_tile_index is not None and 0 <= current_tile_index < total_tiles:
+        indices.add(current_tile_index)
+    if captured_tile_count > 0:
+        indices.add(min(total_tiles - 1, captured_tile_count - 1))
+    indices.add(0)
+    indices.add(total_tiles - 1)
+    return indices
+
+
 @dataclass(frozen=True)
 class AutofocusParams:
     scan_range: int = 20
     scan_step: int = 5
-    autofocus_speed: int = 2
+    autofocus_speed: int = 90
     settle_seconds: float = 0.5
     sample_seconds: float = 1.5
     near_best_ratio: float = 0.96
@@ -343,7 +408,7 @@ def build_autofocus_pass_plan(params: AutofocusParams, mode: AutofocusMode | str
     mid_range = max(2, scan_range // 2)
     mid_step = max(2, coarse_step // 2)
     fine_range = max(1, scan_range // 5)
-    fine_step = max(1, mid_step // 2)
+    fine_step = 1
     return [
         AutofocusPassPlan("coarse", scan_range, coarse_step),
         AutofocusPassPlan("refine", mid_range, mid_step),
@@ -406,9 +471,14 @@ class ProbeStationApp(tk.Tk):
         self.autofocus = AutofocusRunState()
         self.autofocus.reset()
         self.stitching = StitchingRunState(corners=[])
+        self.stage_image_calibration: StitchingCalibration | None = None
+        self.preview_cursor_position: tuple[int, int] | None = None
+        self.preview_display_info: tuple[int, int, int, int] | None = None
         self._photo = None
         self._placeholder_photo = None
         self._last_frame_time = 0.0
+        self._last_stitch_plot_time = 0.0
+        self._last_stitch_plot_progress = -1
         self._position_poll_running = False
         self._closing = False
         self._after_ids: set[str] = set()
@@ -461,7 +531,9 @@ class ProbeStationApp(tk.Tk):
         self.mode_var = tk.StringVar(value=Mode.MANUAL.value)
         self.current_mode_var = tk.StringVar(value=f"Current mode: {Mode.MANUAL.value}")
         self.step_var = tk.StringVar(value="10")
-        self.speed_var = tk.StringVar(value="2")
+        self.speed_var = tk.StringVar(value="90")
+        self.motion_control_mode_var = tk.StringVar(value="Keyboard")
+        self.stage_calibration_var = tk.StringVar(value="XY calibration: not calibrated")
         self.status_var = tk.StringVar(value=f"{APP_TITLE}. Ready. 软件急停不能替代物理急停。")
         self.motor_status_var = tk.StringVar(value="Motor: disconnected")
         self.camera_status_var = tk.StringVar(value="Camera: not opened")
@@ -480,7 +552,7 @@ class ProbeStationApp(tk.Tk):
         self.camera_properties_var = tk.StringVar(value="Camera properties: --")
         self.af_scan_range_var = tk.StringVar(value="20")
         self.af_scan_step_var = tk.StringVar(value="5")
-        self.af_speed_var = tk.StringVar(value="2")
+        self.af_speed_var = tk.StringVar(value="90")
         self.af_mode_var = tk.StringVar(value=AutofocusMode.SEMI.value)
         self.af_settle_seconds_var = tk.StringVar(value="0.5")
         self.af_sample_seconds_var = tk.StringVar(value="1.5")
@@ -494,7 +566,7 @@ class ProbeStationApp(tk.Tk):
         self.af_confirm_score_var = tk.StringVar(value="Confirm score: --")
         self.af_sample_count_var = tk.StringVar(value="Sample points: 0")
         self.stitch_overlap_var = tk.StringVar(value="25")
-        self.stitch_speed_var = tk.StringVar(value="2")
+        self.stitch_speed_var = tk.StringVar(value="90")
         self.stitch_settle_seconds_var = tk.StringVar(value="0.5")
         self.stitch_sample_frames_var = tk.StringVar(value="5")
         self.stitch_output_root_var = tk.StringVar(value=str(Path(__file__).with_name("stitching_output")))
@@ -525,7 +597,7 @@ class ProbeStationApp(tk.Tk):
         body = ttk.Frame(self, padding=(10, 0, 10, 10))
         body.grid(row=1, column=0, sticky="nsew")
         body.columnconfigure(0, minsize=320)
-        body.columnconfigure(1, weight=1, minsize=AUTOFOCUS_CURVE_WIDTH + 12)
+        body.columnconfigure(1, weight=1, minsize=VIDEO_PREVIEW_MAX_WIDTH + 12)
         body.columnconfigure(2, minsize=360)
         body.rowconfigure(0, weight=1)
         left = ttk.Frame(body, padding=(0, 0, 10, 0))
@@ -553,8 +625,12 @@ class ProbeStationApp(tk.Tk):
         )
         ttk.Button(conn, text="Open Camera", command=self._open_camera).grid(row=3, column=1, sticky="ew", padx=4, pady=(5, 0))
         ttk.Button(conn, text="Close", command=self._close_camera).grid(row=3, column=2, sticky="ew", pady=(5, 0))
-        ttk.Label(conn, textvariable=self.motor_status_var, wraplength=270).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Label(conn, textvariable=self.camera_status_var, wraplength=270).grid(row=5, column=0, columnspan=3, sticky="w")
+        ttk.Button(conn, text="Calibrate XY Scale", command=self._start_stage_image_calibration).grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0)
+        )
+        ttk.Label(conn, textvariable=self.stage_calibration_var, wraplength=270).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(conn, textvariable=self.motor_status_var, wraplength=270).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(conn, textvariable=self.camera_status_var, wraplength=270).grid(row=7, column=0, columnspan=3, sticky="w")
 
         self.manual_panel = ttk.LabelFrame(left, text="Motion Control", padding=8)
         move = self.manual_panel
@@ -562,9 +638,19 @@ class ProbeStationApp(tk.Tk):
         for col in range(3):
             move.columnconfigure(col, weight=1)
         ttk.Label(move, text="Step pulses").grid(row=0, column=0, sticky="w")
-        ttk.Entry(move, textvariable=self.step_var, width=8).grid(row=0, column=1, sticky="ew", padx=4)
+        self.step_entry = ttk.Entry(move, textvariable=self.step_var, width=8)
+        self.step_entry.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Label(move, text="Speed %").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(move, textvariable=self.speed_var, width=8).grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.speed_entry = ttk.Entry(move, textvariable=self.speed_var, width=8)
+        self.speed_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
+        for entry in (self.step_entry, self.speed_entry):
+            entry.bind("<KeyPress>", self._numeric_entry_keypress)
+        ttk.Radiobutton(move, text="Keyboard", value="Keyboard", variable=self.motion_control_mode_var).grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Radiobutton(move, text="Mouse", value="Mouse", variable=self.motion_control_mode_var).grid(
+            row=1, column=2, sticky="w", pady=(4, 0)
+        )
         self.manual_move_buttons = [
             ttk.Button(move, text="Y-  W", command=lambda: self._move("Y", -1)),
             ttk.Button(move, text="X+  A", command=lambda: self._move("X", +1)),
@@ -619,6 +705,9 @@ class ProbeStationApp(tk.Tk):
             highlightthickness=0,
         )
         self.video_label.grid(row=0, column=0, sticky="nsew")
+        self.video_label.bind("<Motion>", self._on_preview_mouse_motion)
+        self.video_label.bind("<Leave>", self._on_preview_mouse_leave)
+        self.video_label.bind("<Double-Button-1>", self._on_preview_double_click)
         self._show_camera_placeholder()
 
         self.af_plot_frame = ttk.LabelFrame(center, text="Autofocus Curve", padding=4)
@@ -757,6 +846,12 @@ class ProbeStationApp(tk.Tk):
 
     def _return_focus_to_root(self, event):
         if should_return_focus_to_root_on_enter(getattr(event, "widget", None)):
+            self.focus_set()
+            return "break"
+        return None
+
+    def _numeric_entry_keypress(self, event):
+        if should_release_numeric_entry_focus(getattr(event, "char", ""), getattr(event, "keysym", "")):
             self.focus_set()
             return "break"
         return None
@@ -978,6 +1073,78 @@ class ProbeStationApp(tk.Tk):
         self.auto_wb_var.set(True)
         self._set_status("Camera auto exposure and auto white balance requested.")
 
+    def _start_stage_image_calibration(self) -> None:
+        if self.autofocus.running or self.stitching.running:
+            self._set_status("Cannot calibrate XY scale while autofocus or stitching is running.")
+            return
+        if not self.camera.is_open:
+            self._set_status("Camera is not open; cannot calibrate XY scale.")
+            return
+        if not self.controller or not self.controller.is_open:
+            self._set_status("Motor is not connected; cannot calibrate XY scale.")
+            return
+        confirmed = messagebox.askyesno(
+            "Confirm XY Scale Calibration",
+            "即将在当前位置附近短距离移动 X/Y 并拍摄临时帧，用于标定画面像素与电机 pulse 的关系。\n\n"
+            "请确认当前位置安全、画面有足够纹理、物理急停可用。\n"
+            "软件急停不能替代物理急停。\n\n是否继续？",
+        )
+        if not confirmed:
+            self._set_status("XY scale calibration cancelled.")
+            return
+        self.stitching.running = True
+        self.stitching.stop_requested = False
+        self.stage_calibration_var.set("XY calibration: running")
+        self._set_manual_controls_enabled(False)
+        self.running_state_var.set("Running state: XY calibration")
+        threading.Thread(target=self._stage_image_calibration_worker, daemon=True).start()
+
+    def _stage_image_calibration_worker(self) -> None:
+        start = dict(self.absolute_pos)
+        try:
+            calibration = None
+            last_error = "no trial executed"
+            for step in (20, 40, 80):
+                trial = self._build_current_position_trial(step)
+                frames = []
+                for point in (trial.reference, trial.x_trial, trial.y_trial):
+                    self._move_to_absolute_position(point.x, point.y, point.z, 90)
+                    self._sleep_with_stitching_stop(0.25)
+                    frame, _score = self._capture_stable_stitching_frame(5)
+                    frames.append(frame)
+                try:
+                    calibration = estimate_calibration_from_frames(frames[0], frames[1], frames[2], trial, 0.0)
+                    break
+                except ValueError as exc:
+                    last_error = str(exc)
+                    LOG.warning("XY scale calibration retry required: step=%s error=%s", step, exc)
+            self._move_to_absolute_position(start["X"], start["Y"], start["Z"], 90)
+            if calibration is None:
+                raise RuntimeError(f"XY scale calibration failed: {last_error}")
+            self.device_queue.put(("stage_calibration_done", calibration))
+        except Exception as exc:
+            LOG.exception("XY scale calibration failed")
+            if self.controller and self.controller.is_open:
+                try:
+                    self.controller.stop_all()
+                except Exception:
+                    LOG.exception("stop_all after XY scale calibration failure failed")
+            self.device_queue.put(("stage_calibration_error", f"XY scale calibration failed: {exc}"))
+
+    def _build_current_position_trial(self, step: int):
+        origin = TilePoint(
+            row=-1,
+            col=-1,
+            x=int(self.absolute_pos["X"]),
+            y=int(self.absolute_pos["Y"]),
+            z=int(self.absolute_pos["Z"]),
+        )
+        x_trial = TilePoint(row=-1, col=-1, x=origin.x + int(step), y=origin.y, z=origin.z)
+        y_trial = TilePoint(row=-1, col=-1, x=origin.x, y=origin.y + int(step), z=origin.z)
+        from stitching_calibration import CalibrationTrialPlan
+
+        return CalibrationTrialPlan(origin, x_trial, y_trial, int(step), int(step))
+
     def _optional_float(self, value: str) -> float | None:
         text = value.strip()
         if not text:
@@ -1023,6 +1190,75 @@ class ProbeStationApp(tk.Tk):
             except Exception as exc:
                 LOG.exception("manual move failed")
                 self.device_queue.put(("error", f"Move {axis}{'+' if direction > 0 else '-'} failed: {exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_preview_mouse_motion(self, event) -> None:
+        if self.motion_control_mode_var.get() != "Mouse":
+            self.preview_cursor_position = None
+            return
+        info = self.preview_display_info
+        if info is None:
+            return
+        display_w, display_h, _frame_w, _frame_h = info
+        if 0 <= event.x < display_w and 0 <= event.y < display_h:
+            self.preview_cursor_position = (int(event.x), int(event.y))
+        else:
+            self.preview_cursor_position = None
+
+    def _on_preview_mouse_leave(self, _event) -> None:
+        self.preview_cursor_position = None
+
+    def _on_preview_double_click(self, event) -> None:
+        if self.motion_control_mode_var.get() != "Mouse":
+            return
+        if self.stage_image_calibration is None:
+            self._set_status("XY scale is not calibrated; click Calibrate XY Scale first.")
+            return
+        info = self.preview_display_info
+        if info is None:
+            self._set_status("No live preview geometry is available for mouse movement.")
+            return
+        display_w, display_h, frame_w, frame_h = info
+        if not (0 <= event.x < display_w and 0 <= event.y < display_h):
+            return
+        dx_frame = (float(event.x) - display_w / 2.0) * frame_w / display_w
+        dy_frame = (float(event.y) - display_h / 2.0) * frame_h / display_h
+        try:
+            dx_pulses, dy_pulses = stage_delta_from_preview_delta(dx_frame, dy_frame, self.stage_image_calibration)
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        if dx_pulses == 0 and dy_pulses == 0:
+            self._set_status("Mouse target is already at the preview center.")
+            return
+        self._move_relative_xy(dx_pulses, dy_pulses, speed=90)
+
+    def _move_relative_xy(self, dx_pulses: int, dy_pulses: int, speed: int = 90) -> None:
+        if self.autofocus.running:
+            self._set_status("Autofocus is running; mouse movement is disabled except Space/Esc.")
+            return
+        if self.stitching.running:
+            self._set_status("Image stitching is running; mouse movement is disabled except Space/Esc.")
+            return
+        if not self.controller or not self.controller.is_open:
+            self._set_status("Motor is not connected.")
+            return
+        self.recent_command_var.set(f"Recent command: Mouse move dX={dx_pulses} dY={dy_pulses} @ {speed}%")
+        self.running_state_var.set("Running state: mouse move")
+
+        def worker() -> None:
+            try:
+                for axis, delta in (("X", int(dx_pulses)), ("Y", int(dy_pulses))):
+                    if delta == 0:
+                        continue
+                    direction = absolute_delta_to_controller_direction(axis, current=0, target=delta)
+                    self.controller.move_relative(axis, direction, abs(delta), speed)
+                positions = self._safe_read_positions(self.controller)
+                self.device_queue.put(("positions", positions))
+            except Exception as exc:
+                LOG.exception("mouse move failed")
+                self.device_queue.put(("error", f"Mouse move failed: {exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1141,14 +1377,10 @@ class ProbeStationApp(tk.Tk):
     def _refresh_stitching_labels(self) -> None:
         corners = self.stitching.corners or []
         self.stitch_corner_var.set(f"Corners: {len(corners)}/4")
-        if len(corners) >= 3:
-            try:
-                plane = fit_sample_plane(corners)
-                self.stitch_plane_var.set(
-                    f"Plane residual max={plane.max_abs_residual:.2f} rms={plane.rms_residual:.2f}"
-                )
-            except Exception as exc:
-                self.stitch_plane_var.set(f"Plane: invalid ({exc})")
+        if len(corners) == 4:
+            self.stitch_plane_var.set("Plane: will autofocus four corners and fit when scan starts")
+        elif len(corners) >= 1:
+            self.stitch_plane_var.set("Plane: waiting for four XY corners")
         else:
             self.stitch_plane_var.set("Plane: not fitted")
 
@@ -1156,6 +1388,11 @@ class ProbeStationApp(tk.Tk):
         canvas = getattr(self, "stitch_plane_canvas", None)
         if canvas is None:
             return
+        self._last_stitch_plot_time = time.monotonic()
+        self._last_stitch_plot_progress = max(
+            int(self.stitching.captured_tile_count or 0),
+            int(self.stitching.current_tile_index or 0),
+        )
         canvas.delete("all")
         width = max(10, canvas.winfo_width(), int(float(canvas.cget("width"))))
         height = max(10, canvas.winfo_height(), int(float(canvas.cget("height"))))
@@ -1164,7 +1401,7 @@ class ProbeStationApp(tk.Tk):
         corners = self.stitching.corners or []
         tiles = self.stitching.planned_tiles or []
         if not corners and not tiles:
-            canvas.create_text(10, 10, anchor="nw", fill="#7d9d8d", text="Record focused corners to preview the scan plane.")
+            canvas.create_text(10, 10, anchor="nw", fill="#7d9d8d", text="Record four XY corners to preview the scan area.")
             return
         display_corners = corners
         if len(corners) >= 3:
@@ -1196,7 +1433,14 @@ class ProbeStationApp(tk.Tk):
         plot_height = max(1, height - margin * 2)
         half_width = half_cell(x_spacing, plot_width)
         half_height = half_cell(y_spacing, plot_height)
-        for point in model.tiles:
+        draw_indices = preview_tile_draw_indices(
+            len(model.tiles),
+            current_tile_index=self.stitching.current_tile_index,
+            captured_tile_count=self.stitching.captured_tile_count,
+        )
+        for index, point in enumerate(model.tiles):
+            if index not in draw_indices:
+                continue
             x, y = xy(point)
             fill = ""
             if point.state == "done":
@@ -1223,6 +1467,32 @@ class ProbeStationApp(tk.Tk):
             x, y = xy(point)
             canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#06110d", outline="#5bffa0")
             canvas.create_text(x + 7, y - 7, anchor="w", fill="#b6fbd2", text=f"{point.label} z={point.z}")
+        if len(model.tiles) > STITCH_PREVIEW_SAMPLE_TARGET:
+            canvas.create_text(
+                10,
+                height - 10,
+                anchor="sw",
+                fill="#b6fbd2",
+                text=f"Preview sampled {len(draw_indices)}/{len(model.tiles)} tiles",
+            )
+
+    def _request_stitching_plane_redraw(self, *, force: bool = False) -> None:
+        tiles = self.stitching.planned_tiles or []
+        if force or len(tiles) <= STITCH_PREVIEW_SAMPLE_TARGET:
+            self._draw_stitching_plane_view()
+            return
+        progress = max(
+            int(self.stitching.captured_tile_count or 0),
+            int(self.stitching.current_tile_index or 0),
+        )
+        now = time.monotonic()
+        if (
+            progress == 0
+            or progress >= len(tiles) - 1
+            or progress - self._last_stitch_plot_progress >= LARGE_STITCH_REDRAW_TILE_INTERVAL
+            or now - self._last_stitch_plot_time >= LARGE_STITCH_REDRAW_SECONDS
+        ):
+            self._draw_stitching_plane_view()
 
     def _read_stitching_params(self) -> tuple[float, int, float, int, Path]:
         try:
@@ -1253,20 +1523,18 @@ class ProbeStationApp(tk.Tk):
             return
         corners = list(self.stitching.corners or [])
         if len(corners) != 4:
-            self._set_status("Record exactly four manually focused stitching corners before scanning.")
+            self._set_status("Record exactly four stitching XY corners before scanning.")
             return
         try:
             overlap_percent, speed, settle_seconds, sample_frames, output_root = self._read_stitching_params()
-            plane = fit_sample_plane(corners)
             bounds = bounds_from_plane_points(corners)
         except Exception as exc:
             self._set_status(f"Image stitching setup failed: {exc}")
             return
         confirmed = messagebox.askyesno(
             "Confirm Image Stitching Scan",
-            "即将在四角范围内进行短距离试移和内存试拍，以自动标定视野尺寸，随后自动规划并拍摄拼场图片。\n\n"
+            "即将依次移动到四个记录点，先进行小范围高精度自动对焦并拟合样品平面，随后自动规划并拍摄拼场图片。\n\n"
             f"Requested overlap = {overlap_percent:.1f}%\n"
-            f"Plane max residual = {plane.max_abs_residual:.2f} pulses\n"
             "请确认扫描范围安全、物理急停可用、没有探针会碰撞。\n"
             "软件急停不能替代物理急停。\n\n是否继续？",
         )
@@ -1290,7 +1558,7 @@ class ProbeStationApp(tk.Tk):
         LOG.info("Start Image Stitching: overlap=%.1f speed=%s", overlap_percent, speed)
         threading.Thread(
             target=self._stitching_scan_worker,
-            args=(corners, plane, bounds, overlap_percent, speed, settle_seconds, sample_frames, output_root),
+            args=(corners, None, bounds, overlap_percent, speed, settle_seconds, sample_frames, output_root),
             daemon=True,
         ).start()
 
@@ -1317,48 +1585,64 @@ class ProbeStationApp(tk.Tk):
     ) -> None:
         saved_tiles: list[TileRecord] = []
         store: StitchingSessionStore | None = None
+        mosaic_builder: IncrementalMosaicBuilder | None = None
+        mosaic_executor: ThreadPoolExecutor | None = None
+        mosaic_futures: list[Future] = []
         try:
             store = StitchingSessionStore.create(output_root)
             self.device_queue.put(("stitch_output", f"Output: {store.path}"))
+            focused_corners = []
+            for index, corner in enumerate(corners, start=1):
+                self._raise_if_stitching_stopped()
+                self.device_queue.put(("stitch_status", f"Progress: autofocus corner {index}/4"))
+                focused_corners.append(self._focus_stitching_corner(corner, speed, settle_seconds, sample_frames))
+            corners = focused_corners
+            plane = fit_sample_plane(corners)
+            bounds = bounds_from_plane_points(corners)
             boundary_points = boundary_polygon_from_points(corners)
-            calibration = None
-            used_steps: set[tuple[int, int]] = set()
-            calibration_error = "no trial executed"
-            for requested_step in (5, 10, 20, 40, 80):
-                trial = build_in_bounds_trial_plan(
-                    bounds,
-                    plane,
-                    boundary_points=boundary_points,
-                    preferred_step_pulses=requested_step,
-                )
-                step_key = (trial.x_step_pulses, trial.y_step_pulses)
-                if step_key in used_steps:
-                    continue
-                used_steps.add(step_key)
-                trial_frames = []
-                for label, trial_point in (
-                    ("reference", trial.reference),
-                    ("X", trial.x_trial),
-                    ("Y", trial.y_trial),
-                ):
-                    self._raise_if_stitching_stopped()
-                    self.device_queue.put(
-                        ("stitch_status", f"Progress: calibrating {label} frame ({step_key[0]}/{step_key[1]} pulses)")
-                    )
-                    self._move_to_absolute_position(trial_point.x, trial_point.y, trial_point.z, speed)
-                    self._sleep_with_stitching_stop(settle_seconds)
-                    frame, _focus_score = self._capture_stable_stitching_frame(sample_frames)
-                    trial_frames.append(frame)
-                try:
-                    calibration = estimate_calibration_from_frames(
-                        trial_frames[0], trial_frames[1], trial_frames[2], trial, overlap_percent
-                    )
-                    break
-                except ValueError as exc:
-                    calibration_error = str(exc)
-                    LOG.warning("stitching calibration retry required: step=%s error=%s", step_key, exc)
+            calibration = (
+                replace(self.stage_image_calibration, overlap_percent=overlap_percent)
+                if self.stage_image_calibration is not None
+                else None
+            )
             if calibration is None:
-                raise RuntimeError(f"automatic calibration failed inside recorded boundary: {calibration_error}")
+                used_steps: set[tuple[int, int]] = set()
+                calibration_error = "no trial executed"
+                for requested_step in (5, 10, 20, 40, 80):
+                    trial = build_in_bounds_trial_plan(
+                        bounds,
+                        plane,
+                        boundary_points=boundary_points,
+                        preferred_step_pulses=requested_step,
+                    )
+                    step_key = (trial.x_step_pulses, trial.y_step_pulses)
+                    if step_key in used_steps:
+                        continue
+                    used_steps.add(step_key)
+                    trial_frames = []
+                    for label, trial_point in (
+                        ("reference", trial.reference),
+                        ("X", trial.x_trial),
+                        ("Y", trial.y_trial),
+                    ):
+                        self._raise_if_stitching_stopped()
+                        self.device_queue.put(
+                            ("stitch_status", f"Progress: calibrating {label} frame ({step_key[0]}/{step_key[1]} pulses)")
+                        )
+                        self._move_to_absolute_position(trial_point.x, trial_point.y, trial_point.z, speed)
+                        self._sleep_with_stitching_stop(settle_seconds)
+                        frame, _focus_score = self._capture_stable_stitching_frame(sample_frames)
+                        trial_frames.append(frame)
+                    try:
+                        calibration = estimate_calibration_from_frames(
+                            trial_frames[0], trial_frames[1], trial_frames[2], trial, overlap_percent
+                        )
+                        break
+                    except ValueError as exc:
+                        calibration_error = str(exc)
+                        LOG.warning("stitching calibration retry required: step=%s error=%s", step_key, exc)
+                if calibration is None:
+                    raise RuntimeError(f"automatic calibration failed inside recorded boundary: {calibration_error}")
             plan = generate_overlap_scan_plan(
                 bounds,
                 plane,
@@ -1370,6 +1654,10 @@ class ProbeStationApp(tk.Tk):
                 boundary_points=boundary_points,
             )
             tiles = plan.tiles
+            planned_records = [
+                TileRecord(row=tile.row, col=tile.col, x=tile.x, y=tile.y, z=tile.z, filename="", focus_score=0.0)
+                for tile in tiles
+            ]
             self.device_queue.put(("stitch_plan", (calibration, plan)))
             for index, tile in enumerate(tiles, start=1):
                 self._raise_if_stitching_stopped()
@@ -1389,6 +1677,17 @@ class ProbeStationApp(tk.Tk):
                 )
                 saved = store.save_tile(frame, record)
                 saved_tiles.append(saved)
+                if mosaic_builder is None:
+                    mosaic_builder = IncrementalMosaicBuilder(
+                        planned_records,
+                        frame.shape,
+                        x_pixels_per_pulse=calibration.x_pixels_per_pulse,
+                        y_pixels_per_pulse=calibration.y_pixels_per_pulse,
+                    )
+                    mosaic_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stitch-mosaic")
+                    self.device_queue.put(("stitch_status", "Progress: incremental mosaic worker started"))
+                    self.device_queue.put(("mission_event", ("stitch_assembling", "incremental")))
+                mosaic_futures.append(mosaic_executor.submit(mosaic_builder.add_tile, index - 1, frame))
                 self.device_queue.put(("stitch_tile_saved", index))
                 self.device_queue.put(("stitch_status", f"Progress: saved tile {index}/{len(tiles)}"))
             store.write_metadata(
@@ -1406,9 +1705,14 @@ class ProbeStationApp(tk.Tk):
                 calibration=calibration,
             )
             self.device_queue.put(("mission_event", ("stitch_scan_completed", None)))
-            self.device_queue.put(("stitch_status", "Progress: assembling stitched mosaic..."))
-            self.device_queue.put(("mission_event", ("stitch_assembling", None)))
-            mosaic_path = stitch_session_by_metadata(store.path)
+            self.device_queue.put(("stitch_status", "Progress: finalizing stitched mosaic..."))
+            if mosaic_builder is not None:
+                for future in mosaic_futures:
+                    future.result()
+                mosaic_path = mosaic_builder.write(store.path / "stitched_mosaic.png")
+            else:
+                self.device_queue.put(("mission_event", ("stitch_assembling", None)))
+                mosaic_path = stitch_session_by_metadata(store.path)
             self.device_queue.put(("stitch_done", (store.path, mosaic_path)))
         except InterruptedError:
             if store is not None and saved_tiles:
@@ -1427,6 +1731,66 @@ class ProbeStationApp(tk.Tk):
                 except Exception:
                     LOG.exception("stop_all after image stitching failure failed")
             self.device_queue.put(("stitch_error", f"Image stitching failed: {exc}"))
+        finally:
+            if mosaic_executor is not None:
+                mosaic_executor.shutdown(wait=True, cancel_futures=True)
+            if mosaic_builder is not None:
+                mosaic_builder.close()
+
+    def _focus_stitching_corner(
+        self,
+        corner: SamplePlanePoint,
+        speed: int,
+        settle_seconds: float,
+        sample_frames: int,
+    ) -> SamplePlanePoint:
+        self._move_to_absolute_position(corner.x, corner.y, corner.z, speed)
+        params = AutofocusParams(
+            scan_range=50,
+            scan_step=5,
+            autofocus_speed=max(1, min(100, speed)),
+            settle_seconds=max(0.1, settle_seconds),
+            sample_seconds=max(0.2, sample_frames * 0.08),
+            near_best_ratio=0.96,
+        )
+        final_z, _score = self._run_inline_autofocus(params, AutofocusMode.FULL)
+        return SamplePlanePoint(corner.label, corner.x, corner.y, final_z)
+
+    def _run_inline_autofocus(self, params: AutofocusParams, autofocus_mode: AutofocusMode) -> tuple[int, float]:
+        current_offset = 0
+        points: list[AutofocusSamplePoint] = []
+        self._sleep_with_stitching_stop(params.settle_seconds)
+        baseline_score, baseline_iqr, baseline_count = self.sample_focus_at_current_z(params.sample_seconds)
+        points.append(AutofocusSamplePoint(0, baseline_score, baseline_iqr, baseline_count))
+        center_offset = 0
+        for pass_plan in build_autofocus_pass_plan(params, autofocus_mode):
+            pass_points: list[AutofocusSamplePoint] = []
+            for offset in [center_offset + item for item in build_scan_offsets(pass_plan.scan_range, pass_plan.scan_step)]:
+                self._raise_if_stitching_stopped()
+                delta = offset - current_offset
+                if delta:
+                    self._move_z_for_inline_operation(delta, params.autofocus_speed)
+                    current_offset = offset
+                self._sleep_with_stitching_stop(params.settle_seconds)
+                score, iqr, frame_count = self.sample_focus_at_current_z(params.sample_seconds)
+                point = AutofocusSamplePoint(offset, score, iqr, frame_count)
+                points.append(point)
+                pass_points.append(point)
+            center_offset = select_final_autofocus_point(pass_points, params.near_best_ratio).offset
+        final_point = select_final_autofocus_point(points, params.near_best_ratio)
+        delta_back = final_point.offset - current_offset
+        if delta_back:
+            self._move_z_for_inline_operation(delta_back, params.autofocus_speed)
+        return int(self.absolute_pos["Z"]), final_point.score
+
+    def _move_z_for_inline_operation(self, delta: int, speed: int) -> None:
+        if delta == 0:
+            return
+        self._raise_if_stitching_stopped()
+        direction = 1 if delta > 0 else -1
+        controller_direction = logical_direction_to_controller_direction("Z", direction)
+        self.controller.move_relative("Z", controller_direction, abs(delta), speed)
+        self.absolute_pos["Z"] = int(self.absolute_pos["Z"]) + int(delta)
 
     def _move_to_absolute_position(self, x: int, y: int, z: int, speed: int) -> None:
         for axis, target in (("Z", z), ("X", x), ("Y", y)):
@@ -1520,7 +1884,7 @@ class ProbeStationApp(tk.Tk):
             f"Half-range = {params.scan_range} pulses，表示从当前位置到任一方向边缘的距离；总扫描宽度约为 {params.scan_range * 2} pulses。\n"
             "请确认样品/探针/镜头安全。\n"
             "请确认物理急停可用。\n"
-            "第一次测试建议 half-range <= 20, step <= 5, speed <= 2。\n"
+            "默认 speed = 90；第一次测试仍请确认 Z 轴移动路径安全。\n"
             "软件急停不能替代物理急停。\n"
             "是否继续？",
         )
@@ -1588,7 +1952,7 @@ class ProbeStationApp(tk.Tk):
                 return AutofocusParams(
                     scan_range=max(1, int(float(self.af_scan_range_var.get()))),
                     scan_step=5,
-                    autofocus_speed=2,
+                    autofocus_speed=90,
                     settle_seconds=0.5,
                     sample_seconds=1.5,
                     near_best_ratio=0.96,
@@ -1720,7 +2084,7 @@ class ProbeStationApp(tk.Tk):
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
     def _raise_if_autofocus_stopped(self) -> None:
-        if self.autofocus.stop_requested:
+        if self.autofocus.stop_requested or self.stitching.stop_requested:
             raise InterruptedError("autofocus stopped")
 
     def sample_focus_at_current_z(self, sample_seconds: float) -> tuple[float, float, int]:
@@ -1754,7 +2118,7 @@ class ProbeStationApp(tk.Tk):
         iqr = _interquartile_range(values)
         return score, iqr, len(values)
 
-    def _read_speed(self, default: int = 10) -> int:
+    def _read_speed(self, default: int = 90) -> int:
         try:
             _pulses, speed, _changed = clamp_manual_motion_params(1, int(float(self.speed_var.get())))
             return speed
@@ -1860,7 +2224,9 @@ class ProbeStationApp(tk.Tk):
         new_w = max(1, int(width * scale))
         new_h = max(1, int(height * scale))
         resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        resized = draw_preview_crosshair(resized)
+        self.preview_display_info = (new_w, new_h, width, height)
+        cursor = self.preview_cursor_position if self.motion_control_mode_var.get() == "Mouse" else None
+        resized = draw_preview_crosshair(resized, cursor_position=cursor, include_center=True, cursor_radius=8)
         header = f"P6\n{new_w} {new_h}\n255\n".encode("ascii")
         ppm = header + np.ascontiguousarray(resized).tobytes()
         self._photo = tk.PhotoImage(data=ppm, format="PPM")
@@ -1872,6 +2238,7 @@ class ProbeStationApp(tk.Tk):
             PREVIEW_BACKGROUND_COLOR,
             to=(0, 0, VIDEO_PREVIEW_MAX_WIDTH, VIDEO_PREVIEW_MAX_HEIGHT),
         )
+        self.preview_display_info = None
         self.video_label.configure(image=self._placeholder_photo, text=text, compound="center")
 
     def _drain_device_queue(self) -> None:
@@ -1906,6 +2273,28 @@ class ProbeStationApp(tk.Tk):
                 elif kind == "mission_event":
                     event_kind, event_payload = payload
                     self._record_mission_event(str(event_kind), event_payload)
+                elif kind == "stage_calibration_done":
+                    calibration = payload
+                    self.stage_image_calibration = calibration
+                    self.stitching.running = False
+                    self.stitching.stop_requested = False
+                    self._set_manual_controls_enabled(True)
+                    self.running_state_var.set("Running state: idle")
+                    self.stage_calibration_var.set(
+                        "XY calibration: "
+                        f"X={calibration.x_pixels_per_pulse:.4f} px/pulse  "
+                        f"Y={calibration.y_pixels_per_pulse:.4f} px/pulse  "
+                        f"confidence={calibration.confidence:.2f}"
+                    )
+                    self._set_status("XY scale calibration completed.")
+                elif kind == "stage_calibration_error":
+                    self.stitching.running = False
+                    self.stitching.stop_requested = False
+                    self._set_manual_controls_enabled(True)
+                    self.running_state_var.set("Running state: error")
+                    self.stage_calibration_var.set("XY calibration: failed")
+                    self.recent_error_var.set(f"Recent error: {payload}")
+                    self._set_status(str(payload))
                 elif kind == "error":
                     self.recent_error_var.set(f"Recent error: {payload}")
                     self.running_state_var.set("Running state: error")
@@ -1964,13 +2353,13 @@ class ProbeStationApp(tk.Tk):
                         f"Plan: {plan.rows} rows x {plan.cols} cols = {len(plan.tiles)} tiles, "
                         f"overlap={plan.overlap_percent:.1f}%"
                     )
-                    self._draw_stitching_plane_view()
+                    self._request_stitching_plane_redraw(force=True)
                 elif kind == "stitch_tile_index":
                     self.stitching.current_tile_index = int(payload)
-                    self._draw_stitching_plane_view()
+                    self._request_stitching_plane_redraw()
                 elif kind == "stitch_tile_saved":
                     self.stitching.captured_tile_count = int(payload)
-                    self._draw_stitching_plane_view()
+                    self._request_stitching_plane_redraw()
                 elif kind == "stitch_output":
                     self.stitch_output_var.set(str(payload))
                 elif kind == "stitch_done":
@@ -1997,7 +2386,7 @@ class ProbeStationApp(tk.Tk):
                         self.stitching.current_tile_index = None
                         self.stitch_progress_var.set("Progress: stopped")
                         self._set_status("Image stitching stopped.")
-                    self._draw_stitching_plane_view()
+                    self._request_stitching_plane_redraw(force=True)
                 elif kind == "stitch_error":
                     self.stitching.running = False
                     self.stitching.stop_requested = False
@@ -2007,7 +2396,7 @@ class ProbeStationApp(tk.Tk):
                     self.recent_error_var.set(f"Recent error: {payload}")
                     self.stitch_progress_var.set("Progress: failed")
                     self._set_status(str(payload))
-                    self._draw_stitching_plane_view()
+                    self._request_stitching_plane_redraw(force=True)
         except queue.Empty:
             pass
         self._schedule_after(50, self._drain_device_queue)

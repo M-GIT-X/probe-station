@@ -45,11 +45,10 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertIn("Stitched mosaic", stitching.status_fields)
 
     def test_window_and_video_defaults_support_a_larger_primary_preview(self):
-        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1580x1180")
+        self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1840x1180")
         self.assertLessEqual(MIN_WINDOW_WIDTH, 960)
         self.assertLessEqual(MIN_WINDOW_HEIGHT, 620)
-        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_WIDTH, 760)
-        self.assertGreaterEqual(VIDEO_PREVIEW_MAX_HEIGHT, 475)
+        self.assertEqual((VIDEO_PREVIEW_MAX_WIDTH, VIDEO_PREVIEW_MAX_HEIGHT), (1013, 633))
         self.assertIn("CAMERA OFFLINE", PREVIEW_PLACEHOLDER_TEXT)
 
     def test_dynamic_view_footprints_are_smaller_than_the_primary_preview(self):

@@ -1,5 +1,6 @@
 import unittest
 
+from gui_app import preview_tile_draw_indices
 from sample_plane import SamplePlanePoint
 from scan_plan import TilePoint
 from stitching_view_model import build_stitching_view_model
@@ -41,6 +42,23 @@ class StitchingViewModelTest(unittest.TestCase):
         model = build_stitching_view_model(corners, tiles, captured_tile_count=2)
 
         self.assertEqual([tile.state for tile in model.tiles], ["done", "done"])
+
+    def test_preview_tile_draw_indices_draws_all_small_plans(self):
+        self.assertEqual(preview_tile_draw_indices(4, sample_target=800), {0, 1, 2, 3})
+
+    def test_preview_tile_draw_indices_samples_large_plans_and_keeps_progress(self):
+        indices = preview_tile_draw_indices(
+            5000,
+            current_tile_index=1234,
+            captured_tile_count=3456,
+            sample_target=800,
+        )
+
+        self.assertIn(0, indices)
+        self.assertIn(4999, indices)
+        self.assertIn(1234, indices)
+        self.assertIn(3455, indices)
+        self.assertLessEqual(len(indices), 804)
 
 
 if __name__ == "__main__":

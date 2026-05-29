@@ -52,13 +52,15 @@ Use the top mode drop-down to switch between:
 - `Auto Focus`: conservative full-scan autofocus. It only moves Z. It does not
   move X/Y, perform snake scanning, stitching, or multi-point measurement.
   `Semi Auto` uses the user range/step. `Full Auto` currently accepts only range
-  and automatically runs coarse-to-fine Z scans around the best point.
+  and automatically runs coarse-to-fine Z scans around the best point, ending
+  with a 1-pulse fine step.
 - `Image Stitching`: four-corner stitching workflow. The user manually moves to
-  four focused corners, records each X/Y/Z point, then the GUI fits a sample
-  plane. On start, the GUI performs in-bound trial captures to calibrate image
-  scale, derives the tile grid from the requested overlap, and scans with Z
-  compensation. Captured tiles and `metadata.json` are saved in a timestamped
-  folder, followed by `stitched_mosaic.png`.
+  four XY corners and records each point. On start, the GUI refocuses those
+  four corners with a small high-precision autofocus pass, fits the sample
+  plane, calibrates or reuses the X/Y image scale, derives the tile grid from
+  the requested overlap, and scans with Z compensation. Captured tiles and
+  `metadata.json` are saved in a timestamped folder, followed by
+  `stitched_mosaic.png`.
 
 ## Shortcuts
 
@@ -73,7 +75,8 @@ button. 软件急停不能替代物理急停。
 
 Press `Enter` after editing numeric fields such as step, speed, scan range, or
 camera exposure to return focus to the main window before using movement
-shortcuts.
+shortcuts. In the manual movement step/speed fields, pressing a printable
+non-numeric key also returns focus to the main window.
 
 ## Real-Hardware Test Order
 
@@ -83,33 +86,36 @@ shortcuts.
 4. First autofocus parameters:
    - `half-range = 20`
    - `scan_step = 5`
-   - `speed = 1` or `2`
+   - `speed = 90`
    - `settle_seconds = 0.5`
    - `sample_seconds = 1.5`
 5. Use `Image Stitching` only after manual X/Y/Z and camera capture are stable.
    For the first scan, record a small four-corner safe area with no probe
    contact; the application calculates the tile count automatically.
+6. Before using mouse-based movement, run `Calibrate XY Scale` from the device
+   panel at a safe textured location.
 
 ## Image Stitching Workflow
 
 1. Connect the stage and open the camera.
 2. Switch to `Image Stitching`.
 3. Manually move to the first corner of the desired scan area.
-4. Manually focus at that corner, then click `Record Corner`.
+4. Click `Record Corner`; manual focusing at the corner is no longer required.
 5. Repeat for four corners around the desired scan area.
-6. Check the displayed plane residual. A large residual means the corner focus
-   points disagree; clear or delete corners and record them again.
+6. The displayed plane status stays pending until scan start. The GUI will
+   revisit the four corners, autofocus each one, then fit the plane.
 7. Choose `Overlap %` plus conservative motion/capture settings (`Speed %`,
    `Settle s`, and `Frames/tile`).
 8. Click `Start Stitching Scan` and confirm the safety dialog.
-9. Before scanning, the GUI moves to three in-bound trial positions, captures
+9. Before scanning, the GUI uses the device-level XY calibration when available.
+   If it is not available, it moves to three in-bound trial positions, captures
    frames in memory, estimates X/Y pixels per pulse, and automatically plans
    the snake path. Trial images are not saved as tile files.
 10. The GUI saves tile images and `metadata.json` in a new timestamped session
     folder under `stitching_output/`. Metadata includes automatic calibration.
-11. The scan automatically stitches the captured tiles, writes
-    `stitched_mosaic.png`, and displays a completion notification with its
-    saved path.
+11. While scanning, a background worker incrementally accumulates the mosaic as
+    each tile is saved. At the end it finalizes `stitched_mosaic.png` and
+    displays a completion notification with its saved path.
 
 The stitcher starts from stage coordinates, then tries to refine adjacent tile
 placement by matching their overlapping image regions. If the overlap has too
@@ -121,11 +127,6 @@ temporary setup is still vibration-prone.
 Overlapping regions are feather blended when the mosaic is written. The
 stitcher intentionally does not propagate per-tile brightness gains, because
 fixed camera or illumination shading can otherwise become stronger stripes.
-
-During automatic mosaic generation, neighboring tile overlaps are also used to
-estimate gentle brightness compensation. This reduces alternating bright/dark
-bands caused by capture exposure variation without independently normalizing
-away real sample contrast.
 
 The dynamic display below the shared camera preview outlines the planned scan
 grid in green and fills each captured tile area as scanning progresses.
@@ -194,7 +195,8 @@ software-inverted. Z retains its verified manual-control direction.
   selection helpers, property controls, and `reduce_overexposure()`.
 - `focus_metrics.py`: automatic ROI selection, relative focus index, robust
   representative score, and brightness/saturation diagnostics.
-- `sample_plane.py`: fits `Z = aX + bY + c` from manually focused corner points.
+- `sample_plane.py`: fits `Z = aX + bY + c` from corner points after automatic
+  corner refocus.
 - `scan_plan.py`: generates snake-order image-stitching tile grids.
 - `stitching_calibration.py`: estimates signed X/Y image scale using safe
   in-bound trial captures and the requested overlap.
@@ -212,7 +214,7 @@ software-inverted. Z retains its verified manual-control direction.
    scanned width is approximately `2 * half-range`;
 3. in `Semi Auto`, scan the user half-range/step once;
 4. in `Full Auto`, scan coarse, then refine around the best point with smaller
-   range and step;
+   range and a final 1-pulse step;
 5. sample focus index at each point;
 6. choose a near-best stable point;
 7. move Z to the final offset;

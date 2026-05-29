@@ -127,6 +127,34 @@ class ImageStitchingCoreTest(unittest.TestCase):
 
         self.assertTrue(plan.tiles)
         self.assertNotIn((0, 0), [(tile.x, tile.y) for tile in plan.tiles])
+
+    def test_overlap_scan_plan_does_not_cap_user_requested_large_range(self):
+        plane = fit_sample_plane(
+            [
+                SamplePlanePoint("c1", 0, 0, 100),
+                SamplePlanePoint("c2", 200_000, 0, 100),
+                SamplePlanePoint("c3", 200_000, 120_000, 100),
+                SamplePlanePoint("c4", 0, 120_000, 100),
+            ]
+        )
+        bounds = ScanBounds(min_x=0, max_x=200_000, min_y=0, max_y=120_000)
+
+        plan = generate_overlap_scan_plan(
+            bounds,
+            plane,
+            frame_width=1000,
+            frame_height=800,
+            x_pixels_per_pulse=1.0,
+            y_pixels_per_pulse=1.0,
+            overlap_percent=20.0,
+        )
+
+        self.assertEqual(plan.cols, 251)
+        self.assertEqual(plan.rows, 189)
+        self.assertEqual(len(plan.tiles), 47_439)
+        self.assertEqual((plan.tiles[0].x, plan.tiles[0].y), (0, 0))
+        self.assertEqual((plan.tiles[-1].x, plan.tiles[-1].y), (200_000, 120_000))
+
     def test_stitching_store_writes_tile_image_and_metadata(self):
         try:
             import cv2  # noqa: F401
