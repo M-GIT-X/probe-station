@@ -26,7 +26,12 @@ from focus_metrics import (
     stabilize_frame_translation,
 )
 from image_stitcher import IncrementalMosaicBuilder, stitch_session_by_metadata
-from sample_plane import SamplePlanePoint, boundary_polygon_from_points, bounds_from_plane_points, fit_sample_plane
+from sample_plane import (
+    SamplePlanePoint,
+    boundary_polygon_from_points,
+    bounds_from_plane_points,
+    evaluate_plane_consistency,
+)
 from scan_plan import TilePoint, generate_overlap_scan_plan
 from stage_controller import StageController
 from stitching_calibration import StitchingCalibration, build_in_bounds_trial_plan, estimate_calibration_from_frames
@@ -62,6 +67,7 @@ SAFE_MAX_AUTOFOCUS_STEP = 2000
 SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
 MIN_STITCHING_CORNER_AUTOFOCUS_SAMPLE_SECONDS = 1.0
+STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES = 30.0
 DEFAULT_WINDOW_GEOMETRY = "1400x900"
 DEFAULT_CAMERA_INDEX = "1"
 MIN_WINDOW_WIDTH = 960
@@ -1688,13 +1694,54 @@ class ProbeStationApp(tk.Tk):
         try:
             store = StitchingSessionStore.create(output_root)
             self.device_queue.put(("stitch_output", f"Output: {store.path}"))
+            original_corners = list(corners)
             focused_corners = []
-            for index, corner in enumerate(corners, start=1):
+            for index, corner in enumerate(original_corners, start=1):
                 self._raise_if_stitching_stopped()
                 self.device_queue.put(("stitch_status", f"Progress: autofocus corner {index}/4"))
                 focused_corners.append(self._focus_stitching_corner(corner, speed, settle_seconds, sample_frames))
+            plane_report = evaluate_plane_consistency(
+                focused_corners,
+                max_confirmation_residual=STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES,
+            )
+            self.device_queue.put(("stitch_status", f"Progress: {plane_report.message}"))
+            if not plane_report.accepted:
+                if plane_report.suspicious_label:
+                    self.device_queue.put(
+                        (
+                            "stitch_status",
+                            f"Progress: refocusing suspicious corner {plane_report.suspicious_label}",
+                        )
+                    )
+                    focused_by_label = {corner.label: corner for corner in focused_corners}
+                    original_by_label = {corner.label: corner for corner in original_corners}
+                    target = original_by_label[plane_report.suspicious_label]
+                    focused_by_label[target.label] = self._focus_stitching_corner(
+                        target,
+                        speed,
+                        settle_seconds,
+                        sample_frames,
+                    )
+                    focused_corners = [focused_by_label[corner.label] for corner in original_corners]
+                else:
+                    self.device_queue.put(("stitch_status", "Progress: plane check ambiguous; refocusing all four corners once"))
+                    focused_corners = []
+                    for index, corner in enumerate(original_corners, start=1):
+                        self._raise_if_stitching_stopped()
+                        self.device_queue.put(("stitch_status", f"Progress: refocus corner {index}/4"))
+                        focused_corners.append(self._focus_stitching_corner(corner, speed, settle_seconds, sample_frames))
+                plane_report = evaluate_plane_consistency(
+                    focused_corners,
+                    max_confirmation_residual=STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES,
+                )
+                self.device_queue.put(("stitch_status", f"Progress: {plane_report.message}"))
+                if not plane_report.accepted:
+                    raise RuntimeError(
+                        "focused stitching corners do not define a reliable plane: "
+                        f"{plane_report.message}"
+                    )
             corners = focused_corners
-            plane = fit_sample_plane(corners)
+            plane = plane_report.plane
             bounds = bounds_from_plane_points(corners)
             boundary_points = boundary_polygon_from_points(corners)
             calibration = (
@@ -1797,6 +1844,7 @@ class ProbeStationApp(tk.Tk):
                     "settle_seconds": settle_seconds,
                     "sample_frames": sample_frames,
                     "overlap_percent": overlap_percent,
+                    "plane_validation": plane_report.to_dict(),
                 },
                 plane=plane,
                 calibration=calibration,

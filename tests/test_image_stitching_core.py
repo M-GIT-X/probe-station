@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from sample_plane import SamplePlanePoint, boundary_polygon_from_points, fit_sample_plane
+from sample_plane import SamplePlanePoint, boundary_polygon_from_points, evaluate_plane_consistency, fit_sample_plane
 from scan_plan import ScanBounds, generate_overlap_scan_plan, generate_stitching_grid
 from stitching_store import StitchingSessionStore, TileRecord
 from stitching_calibration import calibration_from_shifts
@@ -31,6 +31,34 @@ class ImageStitchingCoreTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "at least three"):
             fit_sample_plane(corners)
+
+    def test_plane_consistency_accepts_four_coplanar_focused_corners(self):
+        corners = [
+            SamplePlanePoint("c1", 0, 0, 100),
+            SamplePlanePoint("c2", 100, 0, 110),
+            SamplePlanePoint("c3", 100, 100, 130),
+            SamplePlanePoint("c4", 0, 100, 120),
+        ]
+
+        report = evaluate_plane_consistency(corners, max_confirmation_residual=5.0)
+
+        self.assertTrue(report.accepted)
+        self.assertIsNone(report.suspicious_label)
+        self.assertLessEqual(report.max_confirmation_residual, 1e-6)
+
+    def test_plane_consistency_rejects_four_corners_that_do_not_confirm_each_other(self):
+        corners = [
+            SamplePlanePoint("c1", 0, 0, 100),
+            SamplePlanePoint("c2", 100, 0, 110),
+            SamplePlanePoint("c3", 100, 100, 180),
+            SamplePlanePoint("c4", 0, 100, 120),
+        ]
+
+        report = evaluate_plane_consistency(corners, max_confirmation_residual=20.0)
+
+        self.assertFalse(report.accepted)
+        self.assertGreater(report.max_confirmation_residual, 20.0)
+        self.assertIn("confirmation residual", report.message)
 
     def test_boundary_polygon_orders_corners_for_safe_in_bounds_checks(self):
         unordered = [

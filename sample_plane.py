@@ -41,6 +41,27 @@ class SamplePlane:
         }
 
 
+@dataclass(frozen=True)
+class PlaneConsistencyReport:
+    plane: SamplePlane
+    accepted: bool
+    residuals: dict[str, float]
+    confirmation_residuals: dict[str, float]
+    max_confirmation_residual: float
+    suspicious_label: str | None
+    message: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "accepted": self.accepted,
+            "residuals": self.residuals,
+            "confirmation_residuals": self.confirmation_residuals,
+            "max_confirmation_residual": self.max_confirmation_residual,
+            "suspicious_label": self.suspicious_label,
+            "message": self.message,
+        }
+
+
 def fit_sample_plane(points: Iterable[SamplePlanePoint]) -> SamplePlane:
     measured = list(points)
     if len(measured) < 3:
@@ -63,6 +84,53 @@ def fit_sample_plane(points: Iterable[SamplePlanePoint]) -> SamplePlane:
         c=float(coefficients[2]),
         max_abs_residual=max_abs,
         rms_residual=rms,
+    )
+
+
+def evaluate_plane_consistency(
+    points: Iterable[SamplePlanePoint],
+    *,
+    max_confirmation_residual: float = 30.0,
+    outlier_gap_ratio: float = 1.35,
+) -> PlaneConsistencyReport:
+    measured = list(points)
+    if len(measured) != 4:
+        raise ValueError("exactly four points are required to confirm a stitching plane")
+
+    plane = fit_sample_plane(measured)
+    residuals = {point.label: float(point.z - plane.z_at(point.x, point.y)) for point in measured}
+    confirmation_residuals: dict[str, float] = {}
+    for held_out in measured:
+        support_points = [point for point in measured if point.label != held_out.label]
+        confirmation_plane = fit_sample_plane(support_points)
+        confirmation_residuals[held_out.label] = abs(float(held_out.z - confirmation_plane.z_at(held_out.x, held_out.y)))
+
+    ranked = sorted(confirmation_residuals.items(), key=lambda item: item[1], reverse=True)
+    worst_label, worst_residual = ranked[0]
+    second_residual = ranked[1][1]
+    accepted = worst_residual <= max_confirmation_residual
+    suspicious_label = None
+    if not accepted and worst_residual >= max(second_residual * outlier_gap_ratio, max_confirmation_residual):
+        suspicious_label = worst_label
+
+    if accepted:
+        message = f"plane accepted: max confirmation residual {worst_residual:.1f} pulses"
+    elif suspicious_label:
+        message = (
+            f"plane rejected: corner {suspicious_label} has confirmation residual "
+            f"{worst_residual:.1f} pulses"
+        )
+    else:
+        message = f"plane rejected: max confirmation residual {worst_residual:.1f} pulses"
+
+    return PlaneConsistencyReport(
+        plane=plane,
+        accepted=accepted,
+        residuals=residuals,
+        confirmation_residuals=confirmation_residuals,
+        max_confirmation_residual=worst_residual,
+        suspicious_label=suspicious_label,
+        message=message,
     )
 
 
