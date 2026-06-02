@@ -90,6 +90,8 @@ def calibration_from_shifts(
     y_movement_pixels = -float(y_frame_shift[1])
     if abs(x_movement_pixels) < 2.0 or abs(y_movement_pixels) < 2.0:
         raise ValueError("calibration image shift is too small to measure reliably")
+    _validate_axis_dominance("X", x_movement_pixels, -float(x_frame_shift[1]))
+    _validate_axis_dominance("Y", y_movement_pixels, -float(y_frame_shift[0]))
     if x_step_pulses <= 0 or y_step_pulses <= 0:
         raise ValueError("calibration step pulses must be positive")
     return StitchingCalibration(
@@ -124,7 +126,7 @@ def estimate_calibration_from_frames(
     x_shift, x_response = cv2.phaseCorrelate(reference, x_frame)
     y_shift, y_response = cv2.phaseCorrelate(reference, y_frame)
     confidence = float(min(x_response, y_response))
-    if confidence < 0.05:
+    if confidence < 0.12:
         raise ValueError("automatic stitching calibration confidence is too low")
     height, width = reference.shape[:2]
     return calibration_from_shifts(
@@ -142,7 +144,15 @@ def estimate_calibration_from_frames(
 def _trial_step(span: int, preferred_step_pulses: int | None) -> int:
     if preferred_step_pulses is not None:
         return max(1, min(span // 4, int(preferred_step_pulses)))
-    return max(1, min(span // 4, 20))
+    return max(1, min(span // 4, 80))
+
+
+def _validate_axis_dominance(axis: str, main_shift: float, cross_shift: float) -> None:
+    if abs(cross_shift) > abs(main_shift) * 0.75:
+        raise ValueError(
+            f"calibration {axis} axis shift is not axis-aligned enough; "
+            "check that the camera view is not rotated/skewed or retry on a textured area"
+        )
 
 
 def _fit_trial_step(

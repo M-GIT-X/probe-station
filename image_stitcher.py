@@ -14,6 +14,7 @@ _COARSE_REGISTRATION_MAX_DIMENSION = 128
 _INTERMEDIATE_REGISTRATION_MAX_DIMENSION = 512
 _STREAMING_TILE_COUNT_SWITCH = 200
 _STREAMING_MOSAIC_PIXEL_SWITCH = 60_000_000
+_REGISTRATION_MIN_IMPROVEMENT_RATIO = 0.85
 
 
 def stitch_tiles_by_stage_coordinates(
@@ -332,7 +333,7 @@ def _estimate_neighbor_delta(
     max_dimension = max(anchor_gray.shape + moving_gray.shape)
     coarse_scale = min(1.0, _COARSE_REGISTRATION_MAX_DIMENSION / max_dimension)
     if coarse_scale >= 1.0:
-        return _search_neighbor_delta(
+        delta, score = _search_neighbor_delta(
             anchor_gray,
             moving_gray,
             center=expected_delta,
@@ -340,11 +341,12 @@ def _estimate_neighbor_delta(
             allowed_center=expected_delta,
             allowed_radius=max_correction,
         )
+        return _accept_neighbor_delta(anchor_gray, moving_gray, delta, score, expected_delta)
 
     coarse_anchor = _resize_gray(anchor_gray, coarse_scale)
     coarse_moving = _resize_gray(moving_gray, coarse_scale)
     coarse_expected = _scale_delta(expected_delta, coarse_scale)
-    coarse_delta = _search_neighbor_delta(
+    coarse_delta, _coarse_score = _search_neighbor_delta(
         coarse_anchor,
         coarse_moving,
         center=coarse_expected,
@@ -357,7 +359,7 @@ def _estimate_neighbor_delta(
         intermediate_anchor = _resize_gray(anchor_gray, intermediate_scale)
         intermediate_moving = _resize_gray(moving_gray, intermediate_scale)
         intermediate_center = _scale_delta(estimate, intermediate_scale)
-        intermediate_delta = _search_neighbor_delta(
+        intermediate_delta, _intermediate_score = _search_neighbor_delta(
             intermediate_anchor,
             intermediate_moving,
             center=intermediate_center,
@@ -365,7 +367,7 @@ def _estimate_neighbor_delta(
         )
         estimate = _unscale_delta(intermediate_delta, intermediate_scale)
 
-    return _search_neighbor_delta(
+    delta, score = _search_neighbor_delta(
         anchor_gray,
         moving_gray,
         center=estimate,
@@ -373,6 +375,7 @@ def _estimate_neighbor_delta(
         allowed_center=expected_delta,
         allowed_radius=max_correction,
     )
+    return _accept_neighbor_delta(anchor_gray, moving_gray, delta, score, expected_delta)
 
 
 def _search_neighbor_delta(
@@ -383,9 +386,9 @@ def _search_neighbor_delta(
     radius: int,
     allowed_center: tuple[int, int] | None = None,
     allowed_radius: int | None = None,
-) -> tuple[int, int]:
+) -> tuple[tuple[int, int], float | None]:
     best_delta = center
-    best_score = float("inf")
+    best_score: float | None = None
     cx, cy = center
     x_candidates = range(cx - radius, cx + radius + 1)
     y_candidates = range(cy - radius, cy + radius + 1)
@@ -395,10 +398,29 @@ def _search_neighbor_delta(
                 if abs(dx - allowed_center[0]) > allowed_radius or abs(dy - allowed_center[1]) > allowed_radius:
                     continue
             score = _overlap_mse(anchor_gray, moving_gray, dx, dy)
-            if score is not None and score < best_score:
+            if score is not None and (best_score is None or score < best_score):
                 best_score = score
                 best_delta = (dx, dy)
-    return best_delta
+    return best_delta, best_score
+
+
+def _accept_neighbor_delta(
+    anchor_gray: np.ndarray,
+    moving_gray: np.ndarray,
+    candidate_delta: tuple[int, int],
+    candidate_score: float | None,
+    expected_delta: tuple[int, int],
+) -> tuple[int, int]:
+    if candidate_delta == expected_delta:
+        return expected_delta
+    if candidate_score is None:
+        return expected_delta
+    expected_score = _overlap_mse(anchor_gray, moving_gray, expected_delta[0], expected_delta[1])
+    if expected_score is None:
+        return expected_delta
+    if candidate_score <= expected_score * _REGISTRATION_MIN_IMPROVEMENT_RATIO:
+        return candidate_delta
+    return expected_delta
 
 
 def _axis_scales(

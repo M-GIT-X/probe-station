@@ -37,6 +37,20 @@ class KeyboardShortcutTest(unittest.TestCase):
         )
         self.assertIsNone(mission_log_message_for_event("positions", {"X": 1}))
 
+    def test_mission_log_announces_camera_exposure_tuning(self):
+        self.assertEqual(
+            mission_log_message_for_event("camera_exposure_tuning_started"),
+            "EXPOSURE CALIBRATION START. Optical feed entering focus readiness sequence.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("camera_exposure_tuning_completed", "exposure=-7 focus=90.00 saturation=0.020"),
+            "EXPOSURE CALIBRATION COMPLETE. exposure=-7 focus=90.00 saturation=0.020.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("camera_exposure_tuning_failed", "timeout"),
+            "EXPOSURE CALIBRATION ABORT. Fault received: timeout.",
+        )
+
     def test_mission_log_announces_stitching_scan_and_mosaic_lifecycle(self):
         self.assertEqual(
             mission_log_message_for_event("stitch_scan_completed"),

@@ -3,6 +3,7 @@ import unittest
 from gui_app import (
     APP_TITLE,
     AUTOFOCUS_CURVE_WIDTH,
+    DEFAULT_CAMERA_INDEX,
     DEFAULT_WINDOW_GEOMETRY,
     EMERGENCY_STOP_BACKGROUND_COLOR,
     EMERGENCY_STOP_FOREGROUND_COLOR,
@@ -47,6 +48,7 @@ class AppModeTitleTest(unittest.TestCase):
 
     def test_window_and_video_defaults_support_a_larger_primary_preview(self):
         self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1400x900")
+        self.assertEqual(DEFAULT_CAMERA_INDEX, "1")
         self.assertLessEqual(MIN_WINDOW_WIDTH, 960)
         self.assertLessEqual(MIN_WINDOW_HEIGHT, 620)
         self.assertEqual((VIDEO_PREVIEW_MAX_WIDTH, VIDEO_PREVIEW_MAX_HEIGHT), (1013, 633))

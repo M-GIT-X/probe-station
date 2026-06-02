@@ -63,6 +63,7 @@ SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
 MIN_STITCHING_CORNER_AUTOFOCUS_SAMPLE_SECONDS = 1.0
 DEFAULT_WINDOW_GEOMETRY = "1400x900"
+DEFAULT_CAMERA_INDEX = "1"
 MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
 VIDEO_PREVIEW_MAX_WIDTH = 1013
@@ -160,6 +161,9 @@ def mission_log_message_for_event(kind: str, payload: object = None) -> str | No
         "motor_disconnected": "STAGE OFFLINE. Motion channel secured.",
         "camera_opened": f"CAMERA ONLINE. Optical feed established: {text}.",
         "camera_closed": "CAMERA OFFLINE. Optical feed secured.",
+        "camera_exposure_tuning_started": "EXPOSURE CALIBRATION START. Optical feed entering focus readiness sequence.",
+        "camera_exposure_tuning_completed": f"EXPOSURE CALIBRATION COMPLETE. {text}.",
+        "camera_exposure_tuning_failed": f"EXPOSURE CALIBRATION ABORT. Fault received: {text}.",
         "autofocus_started": "AUTOFOCUS SEQUENCE START. Z-axis scan authorized.",
         "autofocus_completed": "AUTOFOCUS COMPLETE. Final focus position confirmed.",
         "autofocus_stopped": "AUTOFOCUS HOLD. Stop command acknowledged.",
@@ -496,6 +500,8 @@ class ProbeStationApp(tk.Tk):
         self.stage_image_calibration: StitchingCalibration | None = None
         self.preview_cursor_position: tuple[int, int] | None = None
         self.preview_display_info: tuple[int, int, int, int] | None = None
+        self._preview_base_rgb: np.ndarray | None = None
+        self._inline_autofocus_status_prefix = "Progress: autofocus"
         self._photo = None
         self._placeholder_photo = None
         self._last_frame_time = 0.0
@@ -548,7 +554,7 @@ class ProbeStationApp(tk.Tk):
         self.rowconfigure(1, weight=1)
 
         self.port_var = tk.StringVar(value=default_serial_port())
-        self.camera_index_var = tk.StringVar(value="0")
+        self.camera_index_var = tk.StringVar(value=DEFAULT_CAMERA_INDEX)
         self.camera_backend_var = tk.StringVar(value="DSHOW")
         self.mode_var = tk.StringVar(value=Mode.MANUAL.value)
         self.current_mode_var = tk.StringVar(value=f"Current mode: {Mode.MANUAL.value}")
@@ -1064,6 +1070,8 @@ class ProbeStationApp(tk.Tk):
             return
         samples: list[dict[str, float]] = []
         try:
+            self._set_status("Camera exposure calibration in progress.")
+            self._record_mission_event("camera_exposure_tuning_started")
             self.camera.set_auto_exposure(False)
             self.camera.set_camera_property("gain", 0)
             for exposure in exposure_tuning_candidates():
@@ -1098,9 +1106,14 @@ class ProbeStationApp(tk.Tk):
                 f"Auto exposure tune: exposure={best['exposure']} focus={best['focus_score']:.2f} "
                 f"saturation={best['saturation_fraction']:.3f}"
             )
+            self._record_mission_event(
+                "camera_exposure_tuning_completed",
+                f"exposure={best['exposure']} focus={best['focus_score']:.2f} saturation={best['saturation_fraction']:.3f}",
+            )
         except Exception as exc:
             LOG.exception("camera exposure auto-tune failed")
             self.camera_properties_var.set(f"Auto exposure tune failed: {exc}")
+            self._record_mission_event("camera_exposure_tuning_failed", exc)
 
     def _read_camera_properties(self) -> None:
         if not self.camera.is_open:
@@ -1181,20 +1194,25 @@ class ProbeStationApp(tk.Tk):
         try:
             calibration = None
             last_error = "no trial executed"
-            for step in (20, 40, 80):
+            for step in (80, 160, 320):
+                self.device_queue.put(("stage_calibration_status", f"XY calibration: trying {step} pulse test move"))
                 trial = self._build_current_position_trial(step)
                 frames = []
-                for point in (trial.reference, trial.x_trial, trial.y_trial):
+                for label, point in (("reference", trial.reference), ("X", trial.x_trial), ("Y", trial.y_trial)):
+                    self.device_queue.put(("stage_calibration_status", f"XY calibration: capturing {label} frame @ {step} pulses"))
                     self._move_to_absolute_position(point.x, point.y, point.z, 90)
                     self._sleep_with_stitching_stop(0.25)
                     frame, _score = self._capture_stable_stitching_frame(5)
                     frames.append(frame)
                 try:
+                    self.device_queue.put(("stage_calibration_status", f"XY calibration: estimating scale from {step} pulse move"))
                     calibration = estimate_calibration_from_frames(frames[0], frames[1], frames[2], trial, 0.0)
                     break
                 except ValueError as exc:
                     last_error = str(exc)
+                    self.device_queue.put(("stage_calibration_status", f"XY calibration: retry needed ({last_error})"))
                     LOG.warning("XY scale calibration retry required: step=%s error=%s", step, exc)
+            self.device_queue.put(("stage_calibration_status", "XY calibration: returning to start position"))
             self._move_to_absolute_position(start["X"], start["Y"], start["Z"], 90)
             if calibration is None:
                 raise RuntimeError(f"XY scale calibration failed: {last_error}")
@@ -1282,9 +1300,11 @@ class ProbeStationApp(tk.Tk):
             self.preview_cursor_position = (int(event.x), int(event.y))
         else:
             self.preview_cursor_position = None
+        self._render_preview_overlay()
 
     def _on_preview_mouse_leave(self, _event) -> None:
         self.preview_cursor_position = None
+        self._render_preview_overlay()
 
     def _on_preview_double_click(self, event) -> None:
         if self.motion_control_mode_var.get() != "Mouse":
@@ -1685,7 +1705,7 @@ class ProbeStationApp(tk.Tk):
             if calibration is None:
                 used_steps: set[tuple[int, int]] = set()
                 calibration_error = "no trial executed"
-                for requested_step in (5, 10, 20, 40, 80):
+                for requested_step in (40, 80, 160, 320):
                     trial = build_in_bounds_trial_plan(
                         bounds,
                         plane,
@@ -1784,11 +1804,14 @@ class ProbeStationApp(tk.Tk):
             self.device_queue.put(("mission_event", ("stitch_scan_completed", None)))
             self.device_queue.put(("stitch_status", "Progress: finalizing stitched mosaic..."))
             if mosaic_builder is not None:
+                self.device_queue.put(("stitch_status", "Progress: waiting for mosaic blending worker..."))
                 for future in mosaic_futures:
                     future.result()
+                self.device_queue.put(("stitch_status", "Progress: writing stitched mosaic image..."))
                 mosaic_path = mosaic_builder.write(store.path / "stitched_mosaic.png")
             else:
                 self.device_queue.put(("mission_event", ("stitch_assembling", None)))
+                self.device_queue.put(("stitch_status", "Progress: assembling saved tiles into mosaic..."))
                 mosaic_path = stitch_session_by_metadata(store.path)
             self.device_queue.put(("stitch_done", (store.path, mosaic_path)))
         except InterruptedError:
@@ -1831,6 +1854,7 @@ class ProbeStationApp(tk.Tk):
             near_best_ratio=0.96,
         )
         try:
+            self._inline_autofocus_status_prefix = f"Progress: autofocus corner {corner.label}"
             final_z, _score = self._run_inline_autofocus(params, AutofocusMode.FULL)
         except RuntimeError as exc:
             if "not enough valid focus frames" in str(exc):
@@ -1839,18 +1863,36 @@ class ProbeStationApp(tk.Tk):
                     "check the live camera stream or increase Settle s"
                 ) from exc
             raise
+        finally:
+            self._inline_autofocus_status_prefix = "Progress: autofocus"
         return SamplePlanePoint(corner.label, corner.x, corner.y, final_z)
 
-    def _run_inline_autofocus(self, params: AutofocusParams, autofocus_mode: AutofocusMode) -> tuple[int, float]:
+    def _run_inline_autofocus(
+        self,
+        params: AutofocusParams,
+        autofocus_mode: AutofocusMode,
+        *,
+        status_prefix: str | None = None,
+    ) -> tuple[int, float]:
+        if status_prefix is None:
+            status_prefix = getattr(self, "_inline_autofocus_status_prefix", "Progress: autofocus")
         current_offset = 0
         points: list[AutofocusSamplePoint] = []
         self._sleep_with_stitching_stop(params.settle_seconds)
+        self.device_queue.put(("stitch_status", f"{status_prefix}: baseline"))
         baseline_score, baseline_iqr, baseline_count = self.sample_focus_at_current_z(params.sample_seconds)
         points.append(AutofocusSamplePoint(0, baseline_score, baseline_iqr, baseline_count))
         center_offset = 0
         for pass_plan in build_autofocus_pass_plan(params, autofocus_mode):
             pass_points: list[AutofocusSamplePoint] = []
-            for offset in [center_offset + item for item in build_scan_offsets(pass_plan.scan_range, pass_plan.scan_step)]:
+            offsets = [center_offset + item for item in build_scan_offsets(pass_plan.scan_range, pass_plan.scan_step)]
+            self.device_queue.put(
+                (
+                    "stitch_status",
+                    f"{status_prefix}: {pass_plan.name} pass step {pass_plan.scan_step} ({len(offsets)} samples)",
+                )
+            )
+            for offset in offsets:
                 self._raise_if_stitching_stopped()
                 delta = offset - current_offset
                 if delta:
@@ -2310,8 +2352,15 @@ class ProbeStationApp(tk.Tk):
         new_h = max(1, int(height * scale))
         resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
         self.preview_display_info = (new_w, new_h, width, height)
+        self._preview_base_rgb = resized
+        self._render_preview_overlay()
+
+    def _render_preview_overlay(self) -> None:
+        if self._preview_base_rgb is None or self.preview_display_info is None:
+            return
+        new_w, new_h, _width, _height = self.preview_display_info
         cursor = self.preview_cursor_position if self.motion_control_mode_var.get() == "Mouse" else None
-        resized = draw_preview_crosshair(resized, cursor_position=cursor, include_center=True, cursor_radius=8)
+        resized = draw_preview_crosshair(self._preview_base_rgb, cursor_position=cursor, include_center=True, cursor_radius=8)
         header = f"P6\n{new_w} {new_h}\n255\n".encode("ascii")
         ppm = header + np.ascontiguousarray(resized).tobytes()
         self._photo = tk.PhotoImage(data=ppm, format="PPM")
@@ -2324,6 +2373,7 @@ class ProbeStationApp(tk.Tk):
             to=(0, 0, VIDEO_PREVIEW_MAX_WIDTH, VIDEO_PREVIEW_MAX_HEIGHT),
         )
         self.preview_display_info = None
+        self._preview_base_rgb = None
         self.video_label.configure(image=self._placeholder_photo, text=text, compound="center")
 
     def _drain_device_queue(self) -> None:
@@ -2358,6 +2408,10 @@ class ProbeStationApp(tk.Tk):
                 elif kind == "mission_event":
                     event_kind, event_payload = payload
                     self._record_mission_event(str(event_kind), event_payload)
+                elif kind == "stage_calibration_status":
+                    message = str(payload)
+                    self.stage_calibration_var.set(message)
+                    self._set_status(message)
                 elif kind == "stage_calibration_done":
                     calibration = payload
                     self.stage_image_calibration = calibration

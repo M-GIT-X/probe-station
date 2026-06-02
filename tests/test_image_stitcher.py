@@ -47,6 +47,31 @@ class ImageStitcherTest(unittest.TestCase):
         self.assertEqual(positions[0], (0, 0))
         self.assertEqual(positions[1], (30, 0))
 
+    def test_overlap_registration_keeps_stage_delta_when_match_is_not_clearly_better(self):
+        original_overlap_mse = image_stitcher._overlap_mse
+
+        def ambiguous_overlap_mse(anchor, moving, dx, dy):
+            if (dx, dy) == (35, 0):
+                return 100.0
+            if (dx, dy) == (30, 0):
+                return 94.0
+            return 200.0
+
+        try:
+            image_stitcher._overlap_mse = ambiguous_overlap_mse
+            frame = np.zeros((40, 60, 3), dtype=np.uint8)
+
+            delta = image_stitcher._estimate_neighbor_delta(
+                frame,
+                frame,
+                expected_delta=(35, 0),
+                max_correction=10,
+            )
+        finally:
+            image_stitcher._overlap_mse = original_overlap_mse
+
+        self.assertEqual(delta, (35, 0))
+
     def test_registered_stitcher_uses_overlap_corrected_positions(self):
         rng = np.random.default_rng(8)
         base = rng.integers(0, 255, size=(40, 80, 3), dtype=np.uint8)

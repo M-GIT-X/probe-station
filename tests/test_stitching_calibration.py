@@ -64,6 +64,19 @@ class StitchingCalibrationTest(unittest.TestCase):
                 confidence=0.9,
             )
 
+    def test_calibration_rejects_cross_axis_dominated_motion(self):
+        with self.assertRaisesRegex(ValueError, "axis"):
+            calibration_from_shifts(
+                x_step_pulses=100,
+                y_step_pulses=80,
+                x_frame_shift=(-8.0, 18.0),
+                y_frame_shift=(0.5, -20.0),
+                frame_width=640,
+                frame_height=480,
+                overlap_percent=25.0,
+                confidence=0.9,
+            )
+
     def test_trial_points_remain_inside_recorded_quadrilateral_not_just_bounding_box(self):
         boundary = [(500, 100), (1000, 500), (500, 900), (0, 500)]
 
