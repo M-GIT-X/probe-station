@@ -61,6 +61,7 @@ SAFE_MAX_AUTOFOCUS_RANGE = 5000
 SAFE_MAX_AUTOFOCUS_STEP = 2000
 SAFE_MAX_AUTOFOCUS_SPEED = 100
 MIN_SAMPLE_FRAMES = 3
+MIN_STITCHING_CORNER_AUTOFOCUS_SAMPLE_SECONDS = 1.0
 DEFAULT_WINDOW_GEOMETRY = "1400x900"
 MIN_WINDOW_WIDTH = 960
 MIN_WINDOW_HEIGHT = 620
@@ -1826,10 +1827,18 @@ class ProbeStationApp(tk.Tk):
             scan_step=5,
             autofocus_speed=max(1, min(100, speed)),
             settle_seconds=max(0.1, settle_seconds),
-            sample_seconds=max(0.2, sample_frames * 0.08),
+            sample_seconds=max(MIN_STITCHING_CORNER_AUTOFOCUS_SAMPLE_SECONDS, sample_frames * 0.08),
             near_best_ratio=0.96,
         )
-        final_z, _score = self._run_inline_autofocus(params, AutofocusMode.FULL)
+        try:
+            final_z, _score = self._run_inline_autofocus(params, AutofocusMode.FULL)
+        except RuntimeError as exc:
+            if "not enough valid focus frames" in str(exc):
+                raise RuntimeError(
+                    f"corner {corner.label} autofocus could not collect enough camera frames; "
+                    "check the live camera stream or increase Settle s"
+                ) from exc
+            raise
         return SamplePlanePoint(corner.label, corner.x, corner.y, final_z)
 
     def _run_inline_autofocus(self, params: AutofocusParams, autofocus_mode: AutofocusMode) -> tuple[int, float]:

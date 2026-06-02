@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from gui_app import (
     AutofocusMode,
@@ -10,6 +11,7 @@ from gui_app import (
     SAFE_MAX_AUTOFOCUS_STEP,
     SAFE_MAX_MANUAL_SPEED,
     SAFE_MAX_MANUAL_STEP,
+    ProbeStationApp,
     build_autofocus_pass_plan,
     build_scan_offsets,
     clamp_autofocus_params,
@@ -107,6 +109,31 @@ class AutofocusLogicTest(unittest.TestCase):
 
         self.assertEqual(passes[-1].scan_step, 1)
         self.assertEqual(passes[-1].name, "fine")
+
+    def test_stitching_corner_autofocus_uses_camera_safe_sample_window(self):
+        captured = {}
+
+        def run_inline_autofocus(params, mode):
+            captured["params"] = params
+            captured["mode"] = mode
+            return 123, 456.0
+
+        fake_app = SimpleNamespace(
+            _move_to_absolute_position=lambda *_args: None,
+            _run_inline_autofocus=run_inline_autofocus,
+        )
+
+        result = ProbeStationApp._focus_stitching_corner(
+            fake_app,
+            corner=SimpleNamespace(label="c1", x=1, y=2, z=3),
+            speed=90,
+            settle_seconds=0.0,
+            sample_frames=1,
+        )
+
+        self.assertEqual(result.z, 123)
+        self.assertEqual(captured["mode"], AutofocusMode.FULL)
+        self.assertGreaterEqual(captured["params"].sample_seconds, 1.0)
 
     def test_final_point_prefers_stability_inside_near_best_band(self):
         points = [
