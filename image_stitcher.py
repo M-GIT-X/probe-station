@@ -303,7 +303,7 @@ def refine_tile_positions_by_overlap(
     pixels_per_pulse: float | None = None,
     x_pixels_per_pulse: float | None = None,
     y_pixels_per_pulse: float | None = None,
-    max_correction: int = 60,
+    max_correction: int | None = None,
 ) -> dict[int, tuple[int, int]]:
     """Refine stage-derived tile positions by matching adjacent overlaps."""
     if len(frames) != len(tiles):
@@ -341,7 +341,7 @@ def refine_tile_positions_by_overlap(
                 frames[left_index],
                 frames[index],
                 expected_delta=expected_delta,
-                max_correction=max_correction,
+                max_correction=_registration_search_radius(frames[left_index], frames[index], max_correction),
             )
             positions[index] = (anchor[0] + delta[0], anchor[1] + delta[1])
         elif up_index is not None and up_index in positions:
@@ -354,12 +354,21 @@ def refine_tile_positions_by_overlap(
                 frames[up_index],
                 frames[index],
                 expected_delta=expected_delta,
-                max_correction=max_correction,
+                max_correction=_registration_search_radius(frames[up_index], frames[index], max_correction),
             )
             positions[index] = (anchor[0] + delta[0], anchor[1] + delta[1])
         else:
             positions[index] = expected[index]
     return positions
+
+
+def _registration_search_radius(anchor_frame: np.ndarray, moving_frame: np.ndarray, requested: int | None) -> int:
+    if requested is not None:
+        return max(1, int(requested))
+    anchor_h, anchor_w = anchor_frame.shape[:2]
+    moving_h, moving_w = moving_frame.shape[:2]
+    largest_tile_span = max(anchor_h, anchor_w, moving_h, moving_w)
+    return max(60, int(round(largest_tile_span * 0.35)))
 
 
 def _estimate_neighbor_delta(

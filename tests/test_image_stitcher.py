@@ -188,6 +188,25 @@ class ImageStitcherTest(unittest.TestCase):
 
         self.assertEqual(delta, (300, 0))
 
+    def test_overlap_registration_recovers_when_calibration_error_exceeds_fixed_sixty_pixels(self):
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV is not installed")
+
+        rng = np.random.default_rng(23)
+        base = rng.integers(0, 255, size=(240, 960, 3), dtype=np.uint8)
+        left = base[:, 0:480].copy()
+        right = base[:, 320:800].copy()
+        tiles = [
+            TileRecord(row=0, col=0, x=0, y=0, z=0, filename="left.png", focus_score=1.0),
+            TileRecord(row=0, col=1, x=440, y=0, z=0, filename="right.png", focus_score=1.0),
+        ]
+
+        positions = refine_tile_positions_by_overlap([left, right], tiles, pixels_per_pulse=1.0)
+
+        self.assertEqual(positions[1], (320, 0))
+
     def test_signed_axis_calibration_places_tiles_in_camera_orientation(self):
         left = np.zeros((20, 30, 3), dtype=np.uint8)
         right = np.zeros((20, 30, 3), dtype=np.uint8)
