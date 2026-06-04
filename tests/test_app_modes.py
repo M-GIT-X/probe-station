@@ -13,12 +13,14 @@ from gui_app import (
     MISSION_LOG_FOREGROUND_COLOR,
     Mode,
     PREVIEW_PLACEHOLDER_TEXT,
+    StitchingFocusMode,
     AUTOFOCUS_CURVE_HEIGHT,
     STITCHING_PLOT_SIZE,
     VIDEO_PREVIEW_MAX_HEIGHT,
     VIDEO_PREVIEW_MAX_WIDTH,
     mode_panel_spec,
     scrollable_body_layout_spec,
+    stitching_focus_mode_choices,
     stitching_geometry_input_fields,
     format_stitching_preflight_report,
 )
@@ -46,6 +48,14 @@ class AppModeTitleTest(unittest.TestCase):
         self.assertIn("Record Corner", stitching.primary_actions)
         self.assertNotIn("Run Offline Stitch", stitching.primary_actions)
         self.assertIn("Stitched mosaic", stitching.status_fields)
+
+    def test_image_stitching_exposes_focus_mode_switch_choices(self):
+        self.assertEqual(
+            stitching_focus_mode_choices(),
+            (StitchingFocusMode.SEMI.value, StitchingFocusMode.FULL.value),
+        )
+        self.assertEqual(StitchingFocusMode.SEMI.value, "Semi Auto")
+        self.assertEqual(StitchingFocusMode.FULL.value, "Full Auto")
 
     def test_window_and_video_defaults_support_a_larger_primary_preview(self):
         self.assertEqual(DEFAULT_WINDOW_GEOMETRY, "1400x900")

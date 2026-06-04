@@ -53,6 +53,30 @@ class KeyboardShortcutTest(unittest.TestCase):
 
     def test_mission_log_announces_stitching_scan_and_mosaic_lifecycle(self):
         self.assertEqual(
+            mission_log_message_for_event("stitch_focus_mode", "Full Auto"),
+            "STITCHING FOCUS MODE SET. Full Auto.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("stitch_corner_recorded", "c1 X=1 Y=2 Z=3"),
+            "STITCHING CORNER RECORDED. c1 X=1 Y=2 Z=3.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("stitch_semiauto_plane"),
+            "SEMI AUTO FOCUS MODE. Using operator-focused corner Z positions.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("stitch_fullauto_plane"),
+            "FULL AUTO FOCUS MODE. Probing a 3x3 autofocus grid for robust plane fitting.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("stitch_stop_requested"),
+            "IMAGE STITCHING SEQUENCE HOLD. Stop command acknowledged.",
+        )
+        self.assertEqual(
+            mission_log_message_for_event("stitch_failed", "limit exceeded"),
+            "IMAGE STITCHING ABORT. Fault received: limit exceeded.",
+        )
+        self.assertEqual(
             mission_log_message_for_event("stitch_scan_completed"),
             "SCAN ACQUISITION COMPLETE. All image tiles secured.",
         )

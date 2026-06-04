@@ -62,6 +62,22 @@ class PlaneConsistencyReport:
         }
 
 
+@dataclass(frozen=True)
+class RobustPlaneFitResult:
+    plane: SamplePlane
+    inliers: list[SamplePlanePoint]
+    outliers: list[SamplePlanePoint]
+    message: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "inliers": [point.to_dict() for point in self.inliers],
+            "outliers": [point.to_dict() for point in self.outliers],
+            "message": self.message,
+            "plane": self.plane.to_dict(),
+        }
+
+
 def fit_sample_plane(points: Iterable[SamplePlanePoint]) -> SamplePlane:
     measured = list(points)
     if len(measured) < 3:
@@ -85,6 +101,67 @@ def fit_sample_plane(points: Iterable[SamplePlanePoint]) -> SamplePlane:
         max_abs_residual=max_abs,
         rms_residual=rms,
     )
+
+
+def fit_sample_plane_robust(
+    points: Iterable[SamplePlanePoint],
+    *,
+    max_abs_residual: float = 30.0,
+    min_inliers: int = 6,
+) -> RobustPlaneFitResult:
+    remaining = list(points)
+    if len(remaining) < 3:
+        raise ValueError("at least three points are required to fit a sample plane")
+    min_inliers = max(3, min(int(min_inliers), len(remaining)))
+    outliers: list[SamplePlanePoint] = []
+    while True:
+        plane = fit_sample_plane(remaining)
+        residuals = [(point, abs(float(point.z - plane.z_at(point.x, point.y)))) for point in remaining]
+        worst_point, worst_residual = max(residuals, key=lambda item: item[1])
+        if worst_residual <= max_abs_residual or len(remaining) <= min_inliers:
+            break
+        outliers.append(worst_point)
+        remaining = [point for point in remaining if point.label != worst_point.label]
+
+    plane = fit_sample_plane(remaining)
+    accepted = plane.max_abs_residual <= max_abs_residual
+    message = (
+        f"robust plane accepted: {len(remaining)} inliers, {len(outliers)} outliers, "
+        f"max residual {plane.max_abs_residual:.1f} pulses"
+        if accepted
+        else (
+            f"robust plane warning: {len(remaining)} inliers, {len(outliers)} outliers, "
+            f"max residual {plane.max_abs_residual:.1f} pulses"
+        )
+    )
+    return RobustPlaneFitResult(plane=plane, inliers=remaining, outliers=outliers, message=message)
+
+
+def generate_plane_probe_points(
+    boundary_points: Iterable[SamplePlanePoint],
+    seed_plane: SamplePlane,
+    *,
+    grid_size: int = 3,
+) -> list[SamplePlanePoint]:
+    measured = list(boundary_points)
+    if len(measured) < 3:
+        raise ValueError("at least three boundary points are required to generate probe points")
+    grid_size = max(2, int(grid_size))
+    min_x = min(point.x for point in measured)
+    max_x = max(point.x for point in measured)
+    min_y = min(point.y for point in measured)
+    max_y = max(point.y for point in measured)
+    polygon = boundary_polygon_from_points(measured)
+    x_values = _evenly_spaced_ints(min_x, max_x, grid_size)
+    y_values = _evenly_spaced_ints(min_y, max_y, grid_size)
+    probes: list[SamplePlanePoint] = []
+    for row, y in enumerate(y_values):
+        for col, x in enumerate(x_values):
+            if _point_in_polygon(x, y, polygon):
+                probes.append(SamplePlanePoint(f"p{row + 1}{col + 1}", x, y, seed_plane.z_at(x, y)))
+    if len(probes) < 3:
+        raise ValueError("boundary is too small or irregular for automatic autofocus probe grid")
+    return probes
 
 
 def evaluate_plane_consistency(
@@ -156,3 +233,34 @@ def boundary_polygon_from_points(points: Iterable[SamplePlanePoint]) -> list[tup
     center_y = sum(point.y for point in measured) / len(measured)
     ordered = sorted(measured, key=lambda point: math.atan2(point.y - center_y, point.x - center_x))
     return [(point.x, point.y) for point in ordered]
+
+
+def _evenly_spaced_ints(start: int, stop: int, count: int) -> list[int]:
+    if count == 1:
+        return [int(round((start + stop) / 2))]
+    span = stop - start
+    return [int(round(start + span * index / (count - 1))) for index in range(count)]
+
+
+def _point_in_polygon(x: int, y: int, points: list[tuple[int, int]]) -> bool:
+    if len(points) < 3:
+        return False
+    inside = False
+    previous_x, previous_y = points[-1]
+    for current_x, current_y in points:
+        if _point_on_segment(x, y, previous_x, previous_y, current_x, current_y):
+            return True
+        crosses = (current_y > y) != (previous_y > y)
+        if crosses:
+            intersection_x = (previous_x - current_x) * (y - current_y) / (previous_y - current_y) + current_x
+            if x < intersection_x:
+                inside = not inside
+        previous_x, previous_y = current_x, current_y
+    return inside
+
+
+def _point_on_segment(x: int, y: int, ax: int, ay: int, bx: int, by: int) -> bool:
+    cross = (x - ax) * (by - ay) - (y - ay) * (bx - ax)
+    if cross != 0:
+        return False
+    return min(ax, bx) <= x <= max(ax, bx) and min(ay, by) <= y <= max(ay, by)

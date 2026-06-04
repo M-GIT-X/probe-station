@@ -31,6 +31,9 @@ from sample_plane import (
     boundary_polygon_from_points,
     bounds_from_plane_points,
     evaluate_plane_consistency,
+    fit_sample_plane,
+    fit_sample_plane_robust,
+    generate_plane_probe_points,
 )
 from scan_plan import TilePoint, generate_overlap_scan_plan
 from stage_controller import StageController
@@ -51,6 +54,11 @@ class Mode(Enum):
 
 
 class AutofocusMode(Enum):
+    SEMI = "Semi Auto"
+    FULL = "Full Auto"
+
+
+class StitchingFocusMode(Enum):
     SEMI = "Semi Auto"
     FULL = "Full Auto"
 
@@ -177,6 +185,17 @@ def mission_log_message_for_event(kind: str, payload: object = None) -> str | No
         "stitch_scan_completed": "SCAN ACQUISITION COMPLETE. All image tiles secured.",
         "stitch_assembling": "MOSAIC ASSEMBLY IN PROGRESS. Processing captured tiles.",
         "stitch_completed": f"MOSAIC COMPLETE. Composite image saved: {text}.",
+        "stitch_focus_mode": f"STITCHING FOCUS MODE SET. {text}.",
+        "stitch_corner_recorded": f"STITCHING CORNER RECORDED. {text}.",
+        "stitch_corner_deleted": f"STITCHING CORNER DELETED. {text}.",
+        "stitch_corners_cleared": "STITCHING CORNERS CLEARED. Awaiting four focused boundary points.",
+        "stitch_preflight": f"STITCHING PREFLIGHT REPORT. {text}.",
+        "stitch_started": f"IMAGE STITCHING SEQUENCE START. {text}.",
+        "stitch_cancelled": "IMAGE STITCHING SEQUENCE HOLD. Operator cancelled before motion.",
+        "stitch_stop_requested": "IMAGE STITCHING SEQUENCE HOLD. Stop command acknowledged.",
+        "stitch_failed": f"IMAGE STITCHING ABORT. Fault received: {text}.",
+        "stitch_semiauto_plane": "SEMI AUTO FOCUS MODE. Using operator-focused corner Z positions.",
+        "stitch_fullauto_plane": "FULL AUTO FOCUS MODE. Probing a 3x3 autofocus grid for robust plane fitting.",
         "controlled_stop": "CONTROLLED STOP COMMAND SENT. All axes ordered to halt.",
         "emergency_stop": "SOFTWARE EMERGENCY STOP SENT. Verify physical system state immediately.",
     }
@@ -314,6 +333,10 @@ def mode_panel_spec(mode: Mode | str) -> ModePanelSpec:
 
 def stitching_geometry_input_fields() -> tuple[str, ...]:
     return ("Overlap %",)
+
+
+def stitching_focus_mode_choices() -> tuple[str, ...]:
+    return (StitchingFocusMode.SEMI.value, StitchingFocusMode.FULL.value)
 
 
 def format_stitching_preflight_report(
@@ -626,6 +649,7 @@ class ProbeStationApp(tk.Tk):
         self.stitch_speed_var = tk.StringVar(value="90")
         self.stitch_settle_seconds_var = tk.StringVar(value="0.5")
         self.stitch_sample_frames_var = tk.StringVar(value="5")
+        self.stitch_focus_mode_var = tk.StringVar(value=StitchingFocusMode.FULL.value)
         self.stitch_output_root_var = tk.StringVar(value=str(Path(__file__).with_name("stitching_output")))
         self.stitch_corner_var = tk.StringVar(value="Corners: 0/4")
         self.stitch_plane_var = tk.StringVar(value="Plane: not fitted")
@@ -846,26 +870,41 @@ class ProbeStationApp(tk.Tk):
         stitching.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         for col in range(4):
             stitching.columnconfigure(col, weight=1)
-        ttk.Label(stitching, textvariable=self.stitch_corner_var).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(stitching, textvariable=self.stitch_plane_var, wraplength=300).grid(row=1, column=0, columnspan=4, sticky="w")
-        ttk.Button(stitching, text="Record Corner", command=self._record_stitching_corner).grid(row=2, column=0, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Button(stitching, text="Delete Last", command=self._delete_last_stitching_corner).grid(row=2, column=2, sticky="ew", padx=2, pady=(6, 2))
-        ttk.Button(stitching, text="Clear", command=self._clear_stitching_corners).grid(row=2, column=3, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Label(stitching, text="Focus mode").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            stitching,
+            text=StitchingFocusMode.SEMI.value,
+            value=StitchingFocusMode.SEMI.value,
+            variable=self.stitch_focus_mode_var,
+            command=self._on_stitch_focus_mode_change,
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(
+            stitching,
+            text=StitchingFocusMode.FULL.value,
+            value=StitchingFocusMode.FULL.value,
+            variable=self.stitch_focus_mode_var,
+            command=self._on_stitch_focus_mode_change,
+        ).grid(row=0, column=2, columnspan=2, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_corner_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(stitching, textvariable=self.stitch_plane_var, wraplength=300).grid(row=2, column=0, columnspan=4, sticky="w")
+        ttk.Button(stitching, text="Record Corner", command=self._record_stitching_corner).grid(row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(stitching, text="Delete Last", command=self._delete_last_stitching_corner).grid(row=3, column=2, sticky="ew", padx=2, pady=(6, 2))
+        ttk.Button(stitching, text="Clear", command=self._clear_stitching_corners).grid(row=3, column=3, sticky="ew", padx=2, pady=(6, 2))
         for index, (label, variable) in enumerate(
             [("Overlap %", self.stitch_overlap_var), ("Speed %", self.stitch_speed_var), ("Settle s", self.stitch_settle_seconds_var), ("Frames/tile", self.stitch_sample_frames_var)]
         ):
-            row, col = 3 + index // 2, (index % 2) * 2
+            row, col = 4 + index // 2, (index % 2) * 2
             ttk.Label(stitching, text=label).grid(row=row, column=col, sticky="w")
             ttk.Entry(stitching, textvariable=variable, width=7).grid(row=row, column=col + 1, sticky="ew", padx=2)
-        ttk.Label(stitching, text="Output root").grid(row=5, column=0, sticky="w")
-        ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=5, column=1, columnspan=3, sticky="ew", padx=2)
-        ttk.Label(stitching, textvariable=self.stitch_calibration_var, wraplength=300).grid(row=6, column=0, columnspan=4, sticky="w")
-        ttk.Label(stitching, textvariable=self.stitch_plan_var, wraplength=300).grid(row=7, column=0, columnspan=4, sticky="w")
-        ttk.Label(stitching, textvariable=self.stitch_preflight_var, wraplength=300).grid(row=8, column=0, columnspan=4, sticky="w")
-        ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=9, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=9, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=10, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=11, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, text="Output root").grid(row=6, column=0, sticky="w")
+        ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=6, column=1, columnspan=3, sticky="ew", padx=2)
+        ttk.Label(stitching, textvariable=self.stitch_calibration_var, wraplength=300).grid(row=7, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_plan_var, wraplength=300).grid(row=8, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_preflight_var, wraplength=300).grid(row=9, column=0, columnspan=4, sticky="w")
+        ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=10, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=10, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=11, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=12, column=0, columnspan=4, sticky="w")
 
         self.mission_panel = ttk.LabelFrame(right, text="Mission Log", padding=8)
         mission = self.mission_panel
@@ -982,6 +1021,17 @@ class ProbeStationApp(tk.Tk):
         self._apply_mode_layout()
         LOG.info("mode switched: %s", mode.value)
         self._set_status(f"Mode switched to {mode.value}. 软件急停不能替代物理急停。")
+
+    def _current_stitch_focus_mode(self) -> StitchingFocusMode:
+        try:
+            return StitchingFocusMode(self.stitch_focus_mode_var.get())
+        except ValueError:
+            return StitchingFocusMode.FULL
+
+    def _on_stitch_focus_mode_change(self) -> None:
+        mode = self._current_stitch_focus_mode()
+        self._refresh_stitching_labels()
+        self._record_mission_event("stitch_focus_mode", mode.value)
 
     def _apply_mode_layout(self) -> None:
         spec = mode_panel_spec(self._current_mode())
@@ -1472,6 +1522,7 @@ class ProbeStationApp(tk.Tk):
         self._refresh_stitching_labels()
         self._draw_stitching_plane_view()
         self._set_status(f"Recorded stitching corner {corner.label}: X={corner.x} Y={corner.y} Z={corner.z}.")
+        self._record_mission_event("stitch_corner_recorded", f"{corner.label} X={corner.x} Y={corner.y} Z={corner.z}")
 
     def _delete_last_stitching_corner(self) -> None:
         if self.stitching.running:
@@ -1486,6 +1537,7 @@ class ProbeStationApp(tk.Tk):
         self._refresh_stitching_labels()
         self._draw_stitching_plane_view()
         self._set_status(f"Deleted stitching corner {removed.label}.")
+        self._record_mission_event("stitch_corner_deleted", removed.label)
 
     def _clear_stitching_corners(self) -> None:
         if self.stitching.running:
@@ -1501,12 +1553,16 @@ class ProbeStationApp(tk.Tk):
         self._refresh_stitching_labels()
         self._draw_stitching_plane_view()
         self._set_status("Stitching corners cleared.")
+        self._record_mission_event("stitch_corners_cleared")
 
     def _refresh_stitching_labels(self) -> None:
         corners = self.stitching.corners or []
         self.stitch_corner_var.set(f"Corners: {len(corners)}/4")
         if len(corners) == 4:
-            self.stitch_plane_var.set("Plane: will autofocus four corners and fit when scan starts")
+            if self._current_stitch_focus_mode() == StitchingFocusMode.SEMI:
+                self.stitch_plane_var.set("Plane: will use manually focused corner Z values")
+            else:
+                self.stitch_plane_var.set("Plane: will autofocus a 3x3 probe grid and robustly fit when scan starts")
         elif len(corners) >= 1:
             self.stitch_plane_var.set("Plane: waiting for four XY corners")
         else:
@@ -1659,6 +1715,7 @@ class ProbeStationApp(tk.Tk):
         except Exception as exc:
             self._set_status(f"Image stitching setup failed: {exc}")
             return
+        focus_mode = self._current_stitch_focus_mode()
         preflight_report = format_stitching_preflight_report(
             corner_count=len(corners),
             has_calibration=self.stage_image_calibration is not None,
@@ -1670,9 +1727,15 @@ class ProbeStationApp(tk.Tk):
         self.stitch_preflight_var.set(preflight_report)
         self._last_stitching_preflight_report = preflight_report
         self._set_status(preflight_report)
+        self._record_mission_event("stitch_preflight", f"{preflight_report}; focus mode {focus_mode.value}")
+        focus_prompt = (
+            "半自动模式：将使用用户手动对焦并记录的四个角点 Z 值拟合样品平面，不会在扫描开始前重对焦。\n"
+            if focus_mode == StitchingFocusMode.SEMI
+            else "全自动模式：将四个记录点作为边界，在区域内自动对焦 3x3 probe 点并鲁棒拟合样品平面。\n"
+        )
         confirmed = messagebox.askyesno(
             "Confirm Image Stitching Scan",
-            "即将依次移动到四个记录点，先进行小范围高精度自动对焦并拟合样品平面，随后自动规划并拍摄拼场图片。\n\n"
+            f"{focus_prompt}随后自动规划并拍摄拼场图片。\n\n"
             f"Requested overlap = {overlap_percent:.1f}%\n"
             f"{preflight_report}\n"
             "请确认扫描范围安全、物理急停可用、没有探针会碰撞。\n"
@@ -1680,6 +1743,7 @@ class ProbeStationApp(tk.Tk):
         )
         if not confirmed:
             self._set_status("Image stitching scan cancelled.")
+            self._record_mission_event("stitch_cancelled")
             return
 
         self.stitching.running = True
@@ -1696,9 +1760,10 @@ class ProbeStationApp(tk.Tk):
         self.stitch_calibration_var.set("Calibration: running")
         self.stitch_plan_var.set("Plan: waiting for calibration")
         LOG.info("Start Image Stitching: overlap=%.1f speed=%s", overlap_percent, speed)
+        self._record_mission_event("stitch_started", f"focus mode {focus_mode.value}, overlap {overlap_percent:.1f}%")
         threading.Thread(
             target=self._stitching_scan_worker,
-            args=(corners, None, bounds, overlap_percent, speed, settle_seconds, sample_frames, output_root),
+            args=(corners, None, bounds, overlap_percent, speed, settle_seconds, sample_frames, output_root, focus_mode.value),
             daemon=True,
         ).start()
 
@@ -1709,6 +1774,7 @@ class ProbeStationApp(tk.Tk):
         self.stitching.stop_requested = True
         self.stitch_progress_var.set("Progress: stop requested")
         self._set_status("Stopping image stitching scan...")
+        self._record_mission_event("stitch_stop_requested")
         if self.controller and self.controller.is_open:
             threading.Thread(target=self._safe_stop_worker, daemon=True).start()
 
@@ -1722,6 +1788,7 @@ class ProbeStationApp(tk.Tk):
         settle_seconds: float,
         sample_frames: int,
         output_root: Path,
+        focus_mode: str = StitchingFocusMode.FULL.value,
     ) -> None:
         saved_tiles: list[TileRecord] = []
         store: StitchingSessionStore | None = None
@@ -1732,18 +1799,36 @@ class ProbeStationApp(tk.Tk):
             store = StitchingSessionStore.create(output_root)
             self.device_queue.put(("stitch_output", f"Output: {store.path}"))
             original_corners = list(corners)
-            focused_corners = []
-            for index, corner in enumerate(original_corners, start=1):
-                self._raise_if_stitching_stopped()
-                self.device_queue.put(("stitch_status", f"Progress: autofocus corner {index}/4"))
-                focused_corners.append(self._focus_stitching_corner(corner, speed, settle_seconds, sample_frames))
-            plane_report = evaluate_plane_consistency(
-                focused_corners,
-                max_confirmation_residual=STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES,
-            )
-            self.device_queue.put(("stitch_status", f"Progress: {plane_report.message}"))
-            corners = focused_corners
-            plane = plane_report.plane
+            selected_focus_mode = StitchingFocusMode(focus_mode)
+            if selected_focus_mode == StitchingFocusMode.SEMI:
+                self.device_queue.put(("mission_event", ("stitch_semiauto_plane", None)))
+                focused_corners = original_corners
+                plane_report = evaluate_plane_consistency(
+                    focused_corners,
+                    max_confirmation_residual=STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES,
+                )
+                plane = plane_report.plane
+                plane_validation = plane_report.to_dict()
+                self.device_queue.put(("stitch_status", f"Progress: {plane_report.message}"))
+            else:
+                self.device_queue.put(("mission_event", ("stitch_fullauto_plane", None)))
+                seed_plane = fit_sample_plane(original_corners)
+                probe_points = generate_plane_probe_points(original_corners, seed_plane, grid_size=3)
+                focused_probes = []
+                for index, probe in enumerate(probe_points, start=1):
+                    self._raise_if_stitching_stopped()
+                    self.device_queue.put(("stitch_status", f"Progress: autofocus probe {index}/{len(probe_points)}"))
+                    focused_probes.append(self._focus_stitching_corner(probe, speed, settle_seconds, sample_frames))
+                robust_report = fit_sample_plane_robust(
+                    focused_probes,
+                    max_abs_residual=STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES,
+                    min_inliers=max(6, len(focused_probes) - 2),
+                )
+                plane = robust_report.plane
+                focused_corners = original_corners
+                plane_validation = robust_report.to_dict()
+                self.device_queue.put(("stitch_status", f"Progress: {robust_report.message}"))
+            corners = original_corners
             bounds = bounds_from_plane_points(corners)
             boundary_points = boundary_polygon_from_points(corners)
             calibration = (
@@ -1854,7 +1939,8 @@ class ProbeStationApp(tk.Tk):
                     "sample_frames": sample_frames,
                     "overlap_percent": overlap_percent,
                     "preflight": getattr(self, "_last_stitching_preflight_report", ""),
-                    "plane_validation": plane_report.to_dict(),
+                    "focus_mode": selected_focus_mode.value,
+                    "plane_validation": plane_validation,
                 },
                 plane=plane,
                 calibration=calibration,
@@ -2592,10 +2678,6 @@ class ProbeStationApp(tk.Tk):
                         self.stitch_progress_var.set("Progress: completed")
                         self._set_status(f"Image stitching completed: {mosaic_path}")
                         self._record_mission_event("stitch_completed", mosaic_path)
-                        messagebox.showinfo(
-                            "Image Stitching Completed",
-                            f"扫描完成，大图已自动保存：\n{mosaic_path}",
-                        )
                     else:
                         self.stitching.current_tile_index = None
                         self.stitch_progress_var.set("Progress: stopped")
@@ -2610,6 +2692,7 @@ class ProbeStationApp(tk.Tk):
                     self.recent_error_var.set(f"Recent error: {payload}")
                     self.stitch_progress_var.set("Progress: failed")
                     self._set_status(str(payload))
+                    self._record_mission_event("stitch_failed", payload)
                     self._request_stitching_plane_redraw(force=True)
         except queue.Empty:
             pass

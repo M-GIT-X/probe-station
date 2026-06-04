@@ -3,7 +3,14 @@ import unittest
 
 import numpy as np
 
-from sample_plane import SamplePlanePoint, boundary_polygon_from_points, evaluate_plane_consistency, fit_sample_plane
+from sample_plane import (
+    SamplePlanePoint,
+    boundary_polygon_from_points,
+    evaluate_plane_consistency,
+    fit_sample_plane,
+    fit_sample_plane_robust,
+    generate_plane_probe_points,
+)
 from scan_plan import ScanBounds, generate_overlap_scan_plan, generate_stitching_grid
 from stitching_store import StitchingSessionStore, TileRecord
 from stitching_calibration import calibration_from_shifts
@@ -59,6 +66,41 @@ class ImageStitchingCoreTest(unittest.TestCase):
         self.assertFalse(report.accepted)
         self.assertGreater(report.max_confirmation_residual, 20.0)
         self.assertIn("confirmation residual", report.message)
+
+    def test_generate_plane_probe_points_samples_three_by_three_inside_boundary(self):
+        corners = [
+            SamplePlanePoint("c1", 0, 0, 100),
+            SamplePlanePoint("c2", 100, 0, 110),
+            SamplePlanePoint("c3", 100, 100, 130),
+            SamplePlanePoint("c4", 0, 100, 120),
+        ]
+        plane = fit_sample_plane(corners)
+
+        probes = generate_plane_probe_points(corners, plane, grid_size=3)
+
+        self.assertEqual(len(probes), 9)
+        self.assertEqual((probes[0].x, probes[0].y), (0, 0))
+        self.assertEqual((probes[4].x, probes[4].y), (50, 50))
+        self.assertEqual(probes[4].z, 115)
+
+    def test_robust_plane_fit_drops_one_bad_autofocus_probe(self):
+        points = [
+            SamplePlanePoint("p1", 0, 0, 100),
+            SamplePlanePoint("p2", 50, 0, 105),
+            SamplePlanePoint("p3", 100, 0, 110),
+            SamplePlanePoint("p4", 0, 50, 110),
+            SamplePlanePoint("p5", 50, 50, 200),
+            SamplePlanePoint("p6", 100, 50, 120),
+            SamplePlanePoint("p7", 0, 100, 120),
+            SamplePlanePoint("p8", 50, 100, 125),
+            SamplePlanePoint("p9", 100, 100, 130),
+        ]
+
+        result = fit_sample_plane_robust(points, max_abs_residual=8.0, min_inliers=6)
+
+        self.assertEqual([point.label for point in result.outliers], ["p5"])
+        self.assertEqual(result.plane.z_at(50, 50), 115)
+        self.assertLessEqual(result.plane.max_abs_residual, 1e-6)
 
     def test_boundary_polygon_orders_corners_for_safe_in_bounds_checks(self):
         unordered = [
