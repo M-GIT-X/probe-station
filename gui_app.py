@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import math
 from pathlib import Path
@@ -25,7 +24,7 @@ from focus_metrics import (
     robust_representative,
     stabilize_frame_translation,
 )
-from image_stitcher import IncrementalMosaicBuilder, stitch_session_by_metadata
+from image_stitcher import stitch_session_by_metadata
 from sample_plane import (
     SamplePlanePoint,
     boundary_polygon_from_points,
@@ -1792,9 +1791,6 @@ class ProbeStationApp(tk.Tk):
     ) -> None:
         saved_tiles: list[TileRecord] = []
         store: StitchingSessionStore | None = None
-        mosaic_builder: IncrementalMosaicBuilder | None = None
-        mosaic_executor: ThreadPoolExecutor | None = None
-        mosaic_futures: list[Future] = []
         try:
             store = StitchingSessionStore.create(output_root)
             self.device_queue.put(("stitch_output", f"Output: {store.path}"))
@@ -1885,10 +1881,6 @@ class ProbeStationApp(tk.Tk):
                 boundary_points=boundary_points,
             )
             tiles = plan.tiles
-            planned_records = [
-                TileRecord(row=tile.row, col=tile.col, x=tile.x, y=tile.y, z=tile.z, filename="", focus_score=0.0)
-                for tile in tiles
-            ]
             self.device_queue.put(("stitch_plan", (calibration, plan)))
             for index, tile in enumerate(tiles, start=1):
                 self._raise_if_stitching_stopped()
@@ -1915,17 +1907,6 @@ class ProbeStationApp(tk.Tk):
                 )
                 saved = store.save_tile(frame, record)
                 saved_tiles.append(saved)
-                if mosaic_builder is None:
-                    mosaic_builder = IncrementalMosaicBuilder(
-                        planned_records,
-                        frame.shape,
-                        x_pixels_per_pulse=calibration.x_pixels_per_pulse,
-                        y_pixels_per_pulse=calibration.y_pixels_per_pulse,
-                    )
-                    mosaic_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stitch-mosaic")
-                    self.device_queue.put(("stitch_status", "Progress: incremental mosaic worker started"))
-                    self.device_queue.put(("mission_event", ("stitch_assembling", "incremental")))
-                mosaic_futures.append(mosaic_executor.submit(mosaic_builder.add_tile, index - 1, frame))
                 self.device_queue.put(("stitch_tile_saved", index))
                 self.device_queue.put(("stitch_status", f"Progress: saved tile {index}/{len(tiles)}"))
             store.write_metadata(
@@ -1947,21 +1928,9 @@ class ProbeStationApp(tk.Tk):
             )
             store.write_tile_quality_csv(saved_tiles)
             self.device_queue.put(("mission_event", ("stitch_scan_completed", None)))
-            self.device_queue.put(("stitch_status", "Progress: finalizing stitched mosaic..."))
-            if mosaic_builder is not None:
-                self.device_queue.put(("stitch_status", "Progress: waiting for mosaic blending worker..."))
-                for future in mosaic_futures:
-                    future.result()
-                self.device_queue.put(("stitch_status", "Progress: writing mechanical-only debug mosaic..."))
-                mosaic_builder.write(store.path / "mechanical_only_mosaic.png")
-                self.device_queue.put(("stitch_status", "Progress: writing mosaic boundary debug image..."))
-                mosaic_builder.write_with_boundaries(store.path / "mosaic_with_boundaries.png")
-                self.device_queue.put(("stitch_status", "Progress: writing stitched mosaic image..."))
-                mosaic_path = mosaic_builder.write(store.path / "stitched_mosaic.png")
-            else:
-                self.device_queue.put(("mission_event", ("stitch_assembling", None)))
-                self.device_queue.put(("stitch_status", "Progress: assembling saved tiles into mosaic..."))
-                mosaic_path = stitch_session_by_metadata(store.path)
+            self.device_queue.put(("mission_event", ("stitch_assembling", None)))
+            self.device_queue.put(("stitch_status", "Progress: assembling saved tiles into mosaic..."))
+            mosaic_path = stitch_session_by_metadata(store.path)
             self.device_queue.put(("stitch_done", (store.path, mosaic_path)))
         except InterruptedError:
             if store is not None and saved_tiles:
@@ -1980,11 +1949,6 @@ class ProbeStationApp(tk.Tk):
                 except Exception:
                     LOG.exception("stop_all after image stitching failure failed")
             self.device_queue.put(("stitch_error", f"Image stitching failed: {exc}"))
-        finally:
-            if mosaic_executor is not None:
-                mosaic_executor.shutdown(wait=True, cancel_futures=True)
-            if mosaic_builder is not None:
-                mosaic_builder.close()
 
     def _focus_stitching_corner(
         self,
