@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import csv
 import json
 from pathlib import Path
 import time
@@ -19,8 +20,14 @@ class TileRecord:
     z: int
     filename: str
     focus_score: float
+    mean_brightness: float | None = None
+    saturation_fraction: float | None = None
+    underexposed_fraction: float | None = None
+    overexposed: bool | None = None
+    sample_frames: int | None = None
+    saved_from_raw_frame: bool | None = None
 
-    def to_dict(self) -> dict[str, int | float | str]:
+    def to_dict(self) -> dict[str, int | float | str | bool | None]:
         return asdict(self)
 
 
@@ -74,6 +81,31 @@ class StitchingSessionStore:
             payload["calibration"] = calibration.to_dict()
         path = self.path / "metadata.json"
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+
+    def write_tile_quality_csv(self, tiles: list[TileRecord]) -> Path:
+        fields = [
+            "row",
+            "col",
+            "x",
+            "y",
+            "z",
+            "filename",
+            "focus_score",
+            "mean_brightness",
+            "saturation_fraction",
+            "underexposed_fraction",
+            "overexposed",
+            "sample_frames",
+            "saved_from_raw_frame",
+        ]
+        path = self.path / "tile_quality.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for tile in tiles:
+                data = tile.to_dict()
+                writer.writerow({field: data.get(field) for field in fields})
         return path
 
 

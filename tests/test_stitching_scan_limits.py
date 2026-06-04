@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -11,13 +12,21 @@ from scan_plan import TilePoint
 
 
 class FakeIncrementalMosaicBuilder:
+    writes = []
+
     def __init__(self, *_args, **_kwargs):
+        type(self).writes = []
         self.added = []
 
     def add_tile(self, index, frame):
         self.added.append((index, frame.shape))
 
     def write(self, output):
+        type(self).writes.append(Path(output).name)
+        return Path(output)
+
+    def write_with_boundaries(self, output):
+        type(self).writes.append(Path(output).name)
         return Path(output)
 
     def close(self):
@@ -98,6 +107,36 @@ if __name__ == "__main__":
 
 
 class StitchingCornerAutofocusTest(unittest.TestCase):
+    def test_stitching_capture_scores_stabilized_frame_but_returns_raw_frame(self):
+        raw_frame = np.full((6, 6, 3), 40, dtype=np.uint8)
+        stabilized_frame = np.full((6, 6, 3), 200, dtype=np.uint8)
+        fake_app = SimpleNamespace(
+            camera=SimpleNamespace(read_frame=Mock(return_value=raw_frame)),
+            camera_lock=threading.Lock(),
+            _raise_if_stitching_stopped=lambda: None,
+        )
+
+        with (
+            patch("gui_app.stabilize_frame_translation", return_value=(stabilized_frame, {"applied": True})),
+            patch("gui_app.auto_select_rois", return_value=[(0, 0, 6, 6)]),
+            patch("gui_app.calculate_focus_index", return_value=321.0),
+            patch(
+                "gui_app.brightness_diagnostics",
+                return_value={
+                    "mean_brightness": 200.0,
+                    "frame_saturation": 0.0,
+                    "underexposed_fraction": 0.0,
+                    "overexposed": False,
+                },
+            ),
+        ):
+            frame, score = ProbeStationApp._capture_stable_stitching_frame(fake_app, 1)
+
+        np.testing.assert_array_equal(frame, raw_frame)
+        self.assertEqual(score, 321.0)
+        self.assertTrue(fake_app._last_stitching_capture_info["saved_from_raw_frame"])
+        self.assertEqual(fake_app._last_stitching_capture_info["mean_brightness"], 200.0)
+
     def test_scan_worker_refocuses_recorded_xy_corners_before_fitting_plane(self):
         events = []
         focused_z_values = iter([10, 20, 30, 40])
@@ -164,10 +203,15 @@ class StitchingCornerAutofocusTest(unittest.TestCase):
 
         written_corners = store.write_metadata.call_args.kwargs["corners"]
         self.assertEqual([corner.z for corner in written_corners], [10, 20, 30, 40])
+        store.write_tile_quality_csv.assert_called_once()
+        self.assertEqual(
+            FakeIncrementalMosaicBuilder.writes,
+            ["mechanical_only_mosaic.png", "mosaic_with_boundaries.png", "stitched_mosaic.png"],
+        )
 
-    def test_scan_worker_retries_all_corners_once_when_plane_confirmation_is_ambiguous(self):
+    def test_scan_worker_records_plane_confirmation_without_refocusing_from_geometry(self):
         events = []
-        focused_z_values = iter([0, 0, 80, 0, 0, 0, 0, 0])
+        focused_z_values = iter([0, 0, 80, 0])
         focus_calls = []
 
         def focus_corner(corner, speed, settle_seconds, sample_frames):
@@ -231,48 +275,8 @@ class StitchingCornerAutofocusTest(unittest.TestCase):
                 output_root=Path("/tmp"),
             )
 
-        self.assertEqual(focus_calls, ["c1", "c2", "c3", "c4", "c1", "c2", "c3", "c4"])
+        self.assertEqual(focus_calls, ["c1", "c2", "c3", "c4"])
         written_corners = store.write_metadata.call_args.kwargs["corners"]
-        self.assertEqual([corner.z for corner in written_corners], [0, 0, 0, 0])
-
-    def test_scan_worker_stops_when_corner_plane_confirmation_still_fails_after_retry(self):
-        events = []
-
-        def focus_corner(corner, speed, settle_seconds, sample_frames):
-            del speed, settle_seconds, sample_frames
-            z_values = {"c1": 0, "c2": 0, "c3": 80, "c4": 0}
-            return SamplePlanePoint(corner.label, corner.x, corner.y, z_values[corner.label])
-
-        fake_app = SimpleNamespace(
-            device_queue=SimpleNamespace(put=events.append),
-            controller=SimpleNamespace(is_open=True, stop_all=Mock()),
-            stage_image_calibration=None,
-            _raise_if_stitching_stopped=lambda: None,
-            _move_to_absolute_position=lambda *_args: None,
-            _sleep_with_stitching_stop=lambda *_args: None,
-            _capture_stable_stitching_frame=lambda _count: (np.zeros((4, 4, 3), dtype=np.uint8), 1.0),
-            _focus_stitching_corner=focus_corner,
-        )
-        corners = [
-            SamplePlanePoint("c1", 0, 0, 0),
-            SamplePlanePoint("c2", 10, 0, 0),
-            SamplePlanePoint("c3", 10, 10, 0),
-            SamplePlanePoint("c4", 0, 10, 0),
-        ]
-
-        with patch("gui_app.StitchingSessionStore.create", return_value=Mock(path=Path("/tmp/session"))):
-            ProbeStationApp._stitching_scan_worker(
-                fake_app,
-                corners=corners,
-                plane=None,
-                bounds=SimpleNamespace(min_x=0, max_x=10, min_y=0, max_y=10),
-                overlap_percent=25.0,
-                speed=2,
-                settle_seconds=0.0,
-                sample_frames=1,
-                output_root=Path("/tmp"),
-            )
-
-        errors = [payload for kind, payload in events if kind == "stitch_error"]
-        self.assertTrue(errors)
-        self.assertIn("focused stitching corners do not define a reliable plane", errors[0])
+        self.assertEqual([corner.z for corner in written_corners], [0, 0, 80, 0])
+        plane_validation = store.write_metadata.call_args.kwargs["settings"]["plane_validation"]
+        self.assertFalse(plane_validation["accepted"])

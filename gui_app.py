@@ -316,6 +316,29 @@ def stitching_geometry_input_fields() -> tuple[str, ...]:
     return ("Overlap %",)
 
 
+def format_stitching_preflight_report(
+    *,
+    corner_count: int,
+    has_calibration: bool,
+    last_focus_info: dict[str, float | bool],
+    output_root: str,
+    overlap_percent: float,
+    sample_frames: int,
+) -> str:
+    mean_brightness = float(last_focus_info.get("mean_brightness", 0.0))
+    saturation = float(last_focus_info.get("frame_saturation", 0.0))
+    exposure = "exposure OK"
+    if mean_brightness > 225.0 or saturation > 0.10:
+        exposure = "bright/overexposed"
+    elif mean_brightness < 25.0:
+        exposure = "dark"
+    calibration = "calibration ready" if has_calibration else "calibration pending"
+    return (
+        f"Preflight: corners {corner_count}/4, {calibration}, {exposure}, "
+        f"overlap {overlap_percent:.1f}%, frames/tile {int(sample_frames)}, output {output_root}"
+    )
+
+
 def preview_tile_draw_indices(
     total_tiles: int,
     *,
@@ -609,6 +632,7 @@ class ProbeStationApp(tk.Tk):
         self.stitch_calibration_var = tk.StringVar(value="Calibration: pending")
         self.stitch_plan_var = tk.StringVar(value="Plan: pending")
         self.stitch_progress_var = tk.StringVar(value="Progress: idle")
+        self.stitch_preflight_var = tk.StringVar(value="Preflight: idle")
         self.stitch_output_var = tk.StringVar(value="Output: --")
         self.abs_pos_var = tk.StringVar(value="Abs X=0  Y=0  Z=0")
         self.rel_pos_var = tk.StringVar(value="Rel X=0  Y=0  Z=0")
@@ -837,10 +861,11 @@ class ProbeStationApp(tk.Tk):
         ttk.Entry(stitching, textvariable=self.stitch_output_root_var, width=28).grid(row=5, column=1, columnspan=3, sticky="ew", padx=2)
         ttk.Label(stitching, textvariable=self.stitch_calibration_var, wraplength=300).grid(row=6, column=0, columnspan=4, sticky="w")
         ttk.Label(stitching, textvariable=self.stitch_plan_var, wraplength=300).grid(row=7, column=0, columnspan=4, sticky="w")
-        ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=8, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=8, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
-        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=10, column=0, columnspan=4, sticky="w")
+        ttk.Label(stitching, textvariable=self.stitch_preflight_var, wraplength=300).grid(row=8, column=0, columnspan=4, sticky="w")
+        ttk.Button(stitching, text="Start Scan", command=self._start_stitching_scan).grid(row=9, column=0, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Button(stitching, text="Stop Scan", command=self._stop_stitching_scan).grid(row=9, column=2, columnspan=2, sticky="ew", padx=2, pady=(8, 2))
+        ttk.Label(stitching, textvariable=self.stitch_progress_var).grid(row=10, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(stitching, textvariable=self.stitch_output_var, wraplength=300).grid(row=11, column=0, columnspan=4, sticky="w")
 
         self.mission_panel = ttk.LabelFrame(right, text="Mission Log", padding=8)
         mission = self.mission_panel
@@ -1634,10 +1659,22 @@ class ProbeStationApp(tk.Tk):
         except Exception as exc:
             self._set_status(f"Image stitching setup failed: {exc}")
             return
+        preflight_report = format_stitching_preflight_report(
+            corner_count=len(corners),
+            has_calibration=self.stage_image_calibration is not None,
+            last_focus_info=self.last_focus_info,
+            output_root=str(output_root),
+            overlap_percent=overlap_percent,
+            sample_frames=sample_frames,
+        )
+        self.stitch_preflight_var.set(preflight_report)
+        self._last_stitching_preflight_report = preflight_report
+        self._set_status(preflight_report)
         confirmed = messagebox.askyesno(
             "Confirm Image Stitching Scan",
             "即将依次移动到四个记录点，先进行小范围高精度自动对焦并拟合样品平面，随后自动规划并拍摄拼场图片。\n\n"
             f"Requested overlap = {overlap_percent:.1f}%\n"
+            f"{preflight_report}\n"
             "请确认扫描范围安全、物理急停可用、没有探针会碰撞。\n"
             "软件急停不能替代物理急停。\n\n是否继续？",
         )
@@ -1705,41 +1742,6 @@ class ProbeStationApp(tk.Tk):
                 max_confirmation_residual=STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES,
             )
             self.device_queue.put(("stitch_status", f"Progress: {plane_report.message}"))
-            if not plane_report.accepted:
-                if plane_report.suspicious_label:
-                    self.device_queue.put(
-                        (
-                            "stitch_status",
-                            f"Progress: refocusing suspicious corner {plane_report.suspicious_label}",
-                        )
-                    )
-                    focused_by_label = {corner.label: corner for corner in focused_corners}
-                    original_by_label = {corner.label: corner for corner in original_corners}
-                    target = original_by_label[plane_report.suspicious_label]
-                    focused_by_label[target.label] = self._focus_stitching_corner(
-                        target,
-                        speed,
-                        settle_seconds,
-                        sample_frames,
-                    )
-                    focused_corners = [focused_by_label[corner.label] for corner in original_corners]
-                else:
-                    self.device_queue.put(("stitch_status", "Progress: plane check ambiguous; refocusing all four corners once"))
-                    focused_corners = []
-                    for index, corner in enumerate(original_corners, start=1):
-                        self._raise_if_stitching_stopped()
-                        self.device_queue.put(("stitch_status", f"Progress: refocus corner {index}/4"))
-                        focused_corners.append(self._focus_stitching_corner(corner, speed, settle_seconds, sample_frames))
-                plane_report = evaluate_plane_consistency(
-                    focused_corners,
-                    max_confirmation_residual=STITCHING_PLANE_CONFIRMATION_RESIDUAL_PULSES,
-                )
-                self.device_queue.put(("stitch_status", f"Progress: {plane_report.message}"))
-                if not plane_report.accepted:
-                    raise RuntimeError(
-                        "focused stitching corners do not define a reliable plane: "
-                        f"{plane_report.message}"
-                    )
             corners = focused_corners
             plane = plane_report.plane
             bounds = bounds_from_plane_points(corners)
@@ -1810,6 +1812,7 @@ class ProbeStationApp(tk.Tk):
                 self._move_to_absolute_position(tile.x, tile.y, tile.z, speed)
                 self._sleep_with_stitching_stop(settle_seconds)
                 frame, focus_score = self._capture_stable_stitching_frame(sample_frames)
+                capture_info = getattr(self, "_last_stitching_capture_info", {})
                 record = TileRecord(
                     row=tile.row,
                     col=tile.col,
@@ -1818,6 +1821,12 @@ class ProbeStationApp(tk.Tk):
                     z=tile.z,
                     filename="",
                     focus_score=focus_score,
+                    mean_brightness=capture_info.get("mean_brightness"),
+                    saturation_fraction=capture_info.get("saturation_fraction"),
+                    underexposed_fraction=capture_info.get("underexposed_fraction"),
+                    overexposed=capture_info.get("overexposed"),
+                    sample_frames=capture_info.get("sample_frames"),
+                    saved_from_raw_frame=capture_info.get("saved_from_raw_frame"),
                 )
                 saved = store.save_tile(frame, record)
                 saved_tiles.append(saved)
@@ -1844,17 +1853,23 @@ class ProbeStationApp(tk.Tk):
                     "settle_seconds": settle_seconds,
                     "sample_frames": sample_frames,
                     "overlap_percent": overlap_percent,
+                    "preflight": getattr(self, "_last_stitching_preflight_report", ""),
                     "plane_validation": plane_report.to_dict(),
                 },
                 plane=plane,
                 calibration=calibration,
             )
+            store.write_tile_quality_csv(saved_tiles)
             self.device_queue.put(("mission_event", ("stitch_scan_completed", None)))
             self.device_queue.put(("stitch_status", "Progress: finalizing stitched mosaic..."))
             if mosaic_builder is not None:
                 self.device_queue.put(("stitch_status", "Progress: waiting for mosaic blending worker..."))
                 for future in mosaic_futures:
                     future.result()
+                self.device_queue.put(("stitch_status", "Progress: writing mechanical-only debug mosaic..."))
+                mosaic_builder.write(store.path / "mechanical_only_mosaic.png")
+                self.device_queue.put(("stitch_status", "Progress: writing mosaic boundary debug image..."))
+                mosaic_builder.write_with_boundaries(store.path / "mosaic_with_boundaries.png")
                 self.device_queue.put(("stitch_status", "Progress: writing stitched mosaic image..."))
                 mosaic_path = mosaic_builder.write(store.path / "stitched_mosaic.png")
             else:
@@ -1981,6 +1996,7 @@ class ProbeStationApp(tk.Tk):
     def _capture_stable_stitching_frame(self, sample_frames: int):
         best_frame = None
         best_score = float("-inf")
+        best_info = None
         local_rois = None
         reference_frame = None
         for _ in range(sample_frames):
@@ -1998,10 +2014,21 @@ class ProbeStationApp(tk.Tk):
                 focus_score *= 0.75
             if focus_score > best_score:
                 best_score = focus_score
-                best_frame = stabilized_frame.copy()
+                best_frame = frame.copy()
+                best_info = dict(info)
             time.sleep(0.03)
         if best_frame is None:
             raise RuntimeError("no valid camera frame captured for stitching")
+        if best_info is None:
+            best_info = brightness_diagnostics(best_frame)
+        self._last_stitching_capture_info = {
+            "mean_brightness": float(best_info.get("mean_brightness", 0.0)),
+            "saturation_fraction": float(best_info.get("frame_saturation", 0.0)),
+            "underexposed_fraction": float(best_info.get("underexposed_fraction", 0.0)),
+            "overexposed": bool(best_info.get("overexposed", False)),
+            "sample_frames": int(sample_frames),
+            "saved_from_raw_frame": True,
+        }
         return best_frame, best_score
 
     def _sleep_with_stitching_stop(self, seconds: float) -> None:

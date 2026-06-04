@@ -11,6 +11,7 @@ from image_stitcher import (
     refine_tile_positions_by_overlap,
     stitch_session_by_metadata,
     stitch_tiles_by_stage_coordinates,
+    draw_tile_boundaries,
 )
 from stitching_store import TileRecord
 
@@ -128,6 +129,17 @@ class ImageStitcherTest(unittest.TestCase):
         overlap_values = np.unique(mosaic[15, 30:50, 0])
 
         self.assertGreater(len(overlap_values), 3)
+
+    def test_draw_tile_boundaries_marks_tile_edges_on_a_copy(self):
+        mosaic = np.zeros((20, 40, 3), dtype=np.uint8)
+        positions = {0: (0, 0), 1: (20, 0)}
+
+        debug = draw_tile_boundaries(mosaic, positions, frame_shape=(20, 20, 3))
+
+        self.assertFalse(np.shares_memory(debug, mosaic))
+        self.assertTrue(np.any(debug[0, :, 1] > 0))
+        self.assertTrue(np.any(debug[:, 20, 1] > 0))
+        self.assertEqual(int(mosaic.max()), 0)
 
     def test_overlap_registration_limits_full_search_work_for_camera_sized_frames(self):
         try:

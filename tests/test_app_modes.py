@@ -20,6 +20,7 @@ from gui_app import (
     mode_panel_spec,
     scrollable_body_layout_spec,
     stitching_geometry_input_fields,
+    format_stitching_preflight_report,
 )
 
 
@@ -74,6 +75,21 @@ class AppModeTitleTest(unittest.TestCase):
 
     def test_stitching_geometry_only_asks_operator_for_overlap(self):
         self.assertEqual(stitching_geometry_input_fields(), ("Overlap %",))
+
+    def test_stitching_preflight_report_summarizes_readiness_and_warnings(self):
+        report = format_stitching_preflight_report(
+            corner_count=4,
+            has_calibration=False,
+            last_focus_info={"mean_brightness": 240.0, "frame_saturation": 0.2},
+            output_root="/tmp/stitching",
+            overlap_percent=25.0,
+            sample_frames=5,
+        )
+
+        self.assertIn("corners 4/4", report)
+        self.assertIn("calibration pending", report)
+        self.assertIn("bright/overexposed", report)
+        self.assertIn("overlap 25.0%", report)
 
 
 if __name__ == "__main__":

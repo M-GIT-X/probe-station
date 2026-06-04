@@ -195,7 +195,20 @@ class ImageStitchingCoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = StitchingSessionStore.create(Path(temp_dir), "demo")
             frame = np.full((4, 5, 3), 127, dtype=np.uint8)
-            record = TileRecord(row=0, col=0, x=10, y=20, z=30, filename="", focus_score=12.5)
+            record = TileRecord(
+                row=0,
+                col=0,
+                x=10,
+                y=20,
+                z=30,
+                filename="",
+                focus_score=12.5,
+                mean_brightness=127.0,
+                saturation_fraction=0.0,
+                overexposed=False,
+                sample_frames=3,
+                saved_from_raw_frame=True,
+            )
 
             saved = store.save_tile(frame, record)
             store.write_metadata(
@@ -208,7 +221,44 @@ class ImageStitchingCoreTest(unittest.TestCase):
             metadata = json.loads((store.path / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["settings"], {"rows": 1, "cols": 1})
             self.assertEqual(metadata["tiles"][0]["filename"], saved.filename)
+            self.assertEqual(metadata["tiles"][0]["mean_brightness"], 127.0)
+            self.assertEqual(metadata["tiles"][0]["sample_frames"], 3)
+            self.assertTrue(metadata["tiles"][0]["saved_from_raw_frame"])
             self.assertEqual(metadata["corners"][0]["label"], "c1")
+
+    def test_stitching_store_writes_tile_quality_csv(self):
+        import csv
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StitchingSessionStore.create(Path(temp_dir), "quality")
+            tiles = [
+                TileRecord(
+                    row=0,
+                    col=1,
+                    x=10,
+                    y=20,
+                    z=30,
+                    filename="tile.png",
+                    focus_score=12.5,
+                    mean_brightness=127.0,
+                    saturation_fraction=0.01,
+                    underexposed_fraction=0.02,
+                    overexposed=False,
+                    sample_frames=5,
+                    saved_from_raw_frame=True,
+                )
+            ]
+
+            output = store.write_tile_quality_csv(tiles)
+
+            with output.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(output.name, "tile_quality.csv")
+            self.assertEqual(rows[0]["filename"], "tile.png")
+            self.assertEqual(rows[0]["focus_score"], "12.5")
+            self.assertEqual(rows[0]["saved_from_raw_frame"], "True")
 
     def test_stitching_store_persists_automatic_calibration(self):
         import tempfile

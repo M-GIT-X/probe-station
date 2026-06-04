@@ -174,6 +174,20 @@ class IncrementalMosaicBuilder:
             raise RuntimeError(f"failed to write stitched mosaic: {output_path}")
         return output_path
 
+    def write_with_boundaries(self, output: Path | str) -> Path:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise RuntimeError("OpenCV is required to write stitched mosaics") from exc
+
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        mosaic = draw_tile_boundaries(self.to_array(), self.positions, self.frame_shape)
+        ok = bool(cv2.imwrite(str(output_path), mosaic))
+        if not ok:
+            raise RuntimeError(f"failed to write stitched mosaic boundaries: {output_path}")
+        return output_path
+
     def to_array(self) -> np.ndarray:
         if self._closed:
             raise RuntimeError("incremental mosaic builder is closed")
@@ -204,6 +218,33 @@ def _accumulate_weighted_frame(accumulator, weights, frame: np.ndarray, left: in
         feather = feather[..., None]
     view += frame.astype(np.float32) * feather
     weight_view += feather
+
+
+def draw_tile_boundaries(
+    mosaic: np.ndarray,
+    positions: dict[int, tuple[int, int]],
+    frame_shape: tuple[int, ...],
+    *,
+    color: tuple[int, int, int] = (0, 255, 0),
+) -> np.ndarray:
+    debug = np.asarray(mosaic).copy()
+    height, width = int(frame_shape[0]), int(frame_shape[1])
+    if debug.ndim == 2:
+        boundary_value = max(color)
+    else:
+        boundary_value = np.asarray(color[: debug.shape[2]], dtype=debug.dtype)
+    for left, top in positions.values():
+        right = min(debug.shape[1] - 1, left + width - 1)
+        bottom = min(debug.shape[0] - 1, top + height - 1)
+        left = max(0, left)
+        top = max(0, top)
+        if right < left or bottom < top:
+            continue
+        debug[top : bottom + 1, left] = boundary_value
+        debug[top : bottom + 1, right] = boundary_value
+        debug[top, left : right + 1] = boundary_value
+        debug[bottom, left : right + 1] = boundary_value
+    return debug
 
 
 def coordinate_tile_positions(
