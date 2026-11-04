@@ -226,7 +226,15 @@ class StageController:
         logical_direction: int,
         pulses: int,
         speed_percent: int,
+        *,
+        cancel: threading.Event | None = None,
+        require_arrival_feedback: bool = False,
     ) -> None:
+        """Send a move and wait for controller feedback.
+
+        Setting cancel skips a pending write or ends the feedback wait. The
+        caller sends a stop command for a move already dispatched.
+        """
         with self._operation_lock:
             axis_value = protocol.normalize_axis(axis)
             if axis_value == protocol.Axis.ALL:
@@ -245,8 +253,11 @@ class StageController:
             controller_direction = (
                 protocol.Direction.POSITIVE if direction >= 0 else protocol.Direction.NEGATIVE
             )
-            self._write(protocol.move_relative(axis_value, controller_direction, pulses, speed_percent))
-            self._wait_for_arrival(axis_value)
+            move = protocol.move_relative(axis_value, controller_direction, pulses, speed_percent)
+            if self._write(move, cancel=cancel):
+                self._wait_for_arrival(
+                    axis_value, cancel=cancel, require_feedback=require_arrival_feedback,
+                )
 
     def stop_all(self) -> None:
         self._write(protocol.stop(protocol.Axis.ALL))
@@ -259,16 +270,20 @@ class StageController:
             raise StageControllerError("serial port is not open")
         return self._serial
 
-    def _write(self, data: bytes) -> None:
+    def _write(self, data: bytes, *, cancel: threading.Event | None = None) -> bool:
         ser = self._require_serial()
         try:
             with self._write_lock:
+                # Check in write order so a latched stop cannot be followed by a pending move.
+                if cancel is not None and cancel.is_set():
+                    return False
                 count = ser.write(data)
                 ser.flush()
         except Exception as exc:
             raise StageControllerError(f"serial write failed: {exc}") from exc
         if count != len(data):
             raise StageControllerError(f"serial write incomplete: wrote {count} of {len(data)} bytes")
+        return True
 
     def _read_frames_until(self, deadline: float) -> list[protocol.Frame]:
         ser = self._require_serial()
@@ -309,14 +324,26 @@ class StageController:
             f"timeout waiting for command 0x{int(expected_command):02X} axis {axis_text}"
         )
 
-    def _wait_for_arrival(self, axis: protocol.Axis) -> None:
+    def _wait_for_arrival(
+        self,
+        axis: protocol.Axis,
+        *,
+        cancel: threading.Event | None = None,
+        require_feedback: bool = False,
+    ) -> None:
         deadline = time.monotonic() + self.motion_timeout
         while time.monotonic() < deadline:
+            if cancel is not None and cancel.is_set():
+                return
             for frame in self._read_frames_until(min(deadline, time.monotonic() + 0.25)):
                 if protocol.is_arrival_feedback(frame, axis):
                     return
                 LOG.debug("ignored frame while waiting for arrival: command=0x%02X", frame.command)
 
+        if cancel is not None and cancel.is_set():
+            return
+        if require_feedback:
+            raise StageControllerError(f"motion did not report arrival for {axis.name}")
         LOG.warning("arrival feedback timed out for %s; trying position read confirmation", axis.name)
         try:
             self.read_position(axis)
