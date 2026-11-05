@@ -48,7 +48,9 @@ class FrameStream:
         with self._condition:
             return self._error
 
-    def start(self, index: int, backend: str = "DSHOW", settings: dict | None = None) -> None:
+    def start(self, index: int, backend: str = "DSHOW", settings: dict | None = None, *,
+              prepare: Callable[[OpenCVCamera, threading.Event], None] | None = None) -> None:
+        """Start capture, optionally preparing the camera on its owning thread."""
         if self.running:
             raise CaptureError("Camera reader is already running")
         with self._condition:
@@ -59,10 +61,11 @@ class FrameStream:
                            "timestamp_source": "host_read_interval",
                            "sensor_timestamps_available": False}
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, args=(index, backend, settings), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(index, backend, settings, prepare), daemon=True)
         self._thread.start()
 
-    def _run(self, index: int, backend: str, settings: dict | None) -> None:
+    def _run(self, index: int, backend: str, settings: dict | None,
+             prepare: Callable[[OpenCVCamera, threading.Event], None] | None) -> None:
         camera = None
         try:
             camera = self._camera_factory()
@@ -71,6 +74,10 @@ class FrameStream:
             if settings:
                 camera.apply_camera_settings(settings)
                 self.source["requested_settings"] = dict(settings)
+            if prepare is not None and not self._stop.is_set():
+                prepare(camera, self._stop)
+            if self._stop.is_set():
+                return
             properties = camera.get_camera_properties()
             with self._condition:
                 self.properties = {
