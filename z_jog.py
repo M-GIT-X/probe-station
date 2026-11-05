@@ -1,4 +1,4 @@
-"""Temporary, keyboard-only Z jog for a locally attached serial controller."""
+"""Temporary, keyboard-only XYZ jog for a locally attached serial controller."""
 
 from __future__ import annotations
 
@@ -11,7 +11,13 @@ import threading
 from stage_controller import StageController, StageControllerError
 
 
-_DIRECTIONS = {"up": 1, "e": 1, "down": -1, "q": -1}
+# Match the logical axes and signs of the main GUI's manual shortcuts.
+_DIRECTIONS = {
+    "w": ("Y", -1), "s": ("Y", 1),
+    "a": ("X", 1), "d": ("X", -1),
+    "q": ("Z", -1), "e": ("Z", 1),
+    "down": ("Z", -1), "up": ("Z", 1),
+}
 _STOP_KEYS = {"space", "escape"}
 _KEY_RELEASE_MS = 30
 _POLL_MS = 30
@@ -25,7 +31,7 @@ class JogWindow:
         self.controller = controller
         self.pulses = pulses
         self.speed = speed
-        self._workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="z-jog")
+        self._workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xyz-jog")
         self._cancel = threading.Event()
         self._move: Future[None] | None = None
         self._stop: Future[None] | None = None
@@ -48,7 +54,7 @@ class JogWindow:
         if armed:
             self.root.focus_set()
         if self._move is None and not self._cancel.is_set() and not self._closing:
-            self.status.set("Ready for one Z step at a time." if armed else _ARM_PROMPT)
+            self.status.set("Ready for one step at a time." if armed else _ARM_PROMPT)
 
     def _key_press(self, event) -> str | None:
         key = event.keysym.lower()
@@ -69,12 +75,12 @@ class JogWindow:
         if key in _STOP_KEYS:
             self._request_stop()
         elif self._armed and not self._closing and not self._cancel.is_set() and self._move is None:
-            direction = _DIRECTIONS[key]
+            axis, direction = _DIRECTIONS[key]
             sign = "+" if direction > 0 else "−"
-            self.status.set(f"Z{sign} step in progress…")
+            self.status.set(f"{axis}{sign} step in progress…")
             self._move = self._workers.submit(
                 self.controller.move_relative,
-                "Z", direction, self.pulses, self.speed,
+                axis, direction, self.pulses, self.speed,
                 cancel=self._cancel, require_arrival_feedback=True,
             )
         return "break"
@@ -125,11 +131,11 @@ class JogWindow:
                 try:
                     move.result()
                 except Exception as exc:
-                    self._fail("Z step", exc)
+                    self._fail("Jog step", exc)
                     self._request_stop()
                 else:
                     next_step = "Ready for the next press." if self._armed else _ARM_PROMPT
-                    self.status.set(f"Controller reported Z arrival. {next_step}")
+                    self.status.set(f"Controller reported arrival. {next_step}")
         if self._stop is not None and self._stop.done():
             self._finish_stop(self._stop)
 
@@ -176,25 +182,28 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import tkinter as tk
     except ImportError as exc:
-        print(f"Z jog requires Tk and a graphical desktop: {exc}", file=sys.stderr)
+        print(f"XYZ jog requires Tk and a graphical desktop: {exc}", file=sys.stderr)
         return 1
     try:
         root = tk.Tk()
     except tk.TclError as exc:
-        print(f"Z jog requires Tk and a graphical desktop: {exc}", file=sys.stderr)
+        print(f"XYZ jog requires Tk and a graphical desktop: {exc}", file=sys.stderr)
         return 1
 
     root.withdraw()
-    controller = StageController(port=port, motion_timeout=5.0)
+    controller = StageController(
+        port=port, motion_timeout=5.0, invert_x=False, invert_y=True, invert_z=False,
+    )
     try:
         controller.open()
         if not controller.test_connection():
             raise StageControllerError("unexpected controller handshake response")
 
-        root.title("Z jog")
+        root.title("XYZ jog")
         instructions = (
             f"{port} | {args.step_pulses} pulse(s) per press @ {args.speed_percent}%\n\n"
-            "Up / E: Z+     Down / Q: Z−\n"
+            "W / S: Y− / Y+     A / D: X+ / X−\n"
+            "Q / E: Z− / Z+     Down / Up: Z− / Z+\n"
             "Space / Esc: software emergency stop     X: exit\n"
             "Keep the physical emergency stop within reach."
         )
@@ -207,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        print(f"Z jog failed: {exc}", file=sys.stderr)
+        print(f"XYZ jog failed: {exc}", file=sys.stderr)
         return 1
     finally:
         controller.close()
