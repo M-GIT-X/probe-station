@@ -203,13 +203,16 @@ class StageController:
             return frame.raw == bytes.fromhex("A3 AA 00 00 00 00 00 00 00 4D 0D 0A")
 
     def read_position(self, axis: str | protocol.Axis) -> int:
+        return int(self.read_axis_state(axis)["position"])
+
+    def read_axis_state(self, axis: str | protocol.Axis) -> dict[str, int | bool | str]:
+        """Read the controller's commanded pulse counter and running flag."""
         with self._operation_lock:
             axis_value = protocol.normalize_axis(axis)
             if axis_value == protocol.Axis.ALL:
                 raise StageControllerError("read_position expects X, Y, or Z; use read_all_positions for ALL")
             frame = self._request(protocol.read_position(axis_value), protocol.Command.READ_POSITION, axis_value)
-            parsed = protocol.parse_position_payload(frame)
-            return int(parsed["position"])
+            return protocol.parse_position_payload(frame)
 
     def read_all_positions(self) -> dict[str, int]:
         with self._operation_lock:

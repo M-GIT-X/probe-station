@@ -8,8 +8,9 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
+from autofocus_v2.autofocus import AutofocusConfig, run_autofocus
 from autofocus_v2.capture import FrameStream
 from autofocus_v2.models import ROI
 from camera_opencv import BACKENDS, cv2, startup_camera_settings
@@ -19,8 +20,11 @@ from z_jog import JogWindow
 
 
 class EmbeddedJog(JogWindow):
-    def __init__(self, root, status, controller, target):
+    def __init__(self, root, status, controller, target, *, blocked=None, on_stop=None, on_exit=None):
         self.target = target
+        self.blocked = blocked or (lambda: False)
+        self.on_stop = on_stop
+        self.on_exit = on_exit
         super().__init__(root, status, controller, 1, 10)
         root.unbind('<Button-1>')
         root.bind('<KeyPress>', self._press_in_panel)
@@ -36,17 +40,30 @@ class EmbeddedJog(JogWindow):
             self._held.clear()
 
     def _set_armed(self, armed):
-        self._armed = armed
-        if armed:
+        self._armed = armed and not self.blocked()
+        if self._armed:
             self.target.focus_set()
         if self._move is None and not self._cancel.is_set() and not self._closing:
-            self.status.set('已启用点动，每次按键移动一步' if armed else '松开移动键，再点击启用点动')
+            self.status.set('已启用点动，每次按键移动一步' if self._armed else '松开移动键，再点击启用点动')
+
+    def _request_stop(self):
+        if self.on_stop is not None:
+            self.on_stop()
+        super()._request_stop()
+
+    def _request_exit(self):
+        if self.on_exit is not None:
+            self.on_exit()
+        else:
+            super()._request_exit()
 
     def _press_in_panel(self, event):
         if event.keysym.lower() in ('space', 'escape'):
             self._request_stop()
             return 'break'
         if self.root.focus_get() is self.target:
+            if self.blocked() and event.keysym.lower() != 'x':
+                self._set_armed(False)
             return self._key_press(event)
         return None
 
@@ -74,9 +91,14 @@ class TrialApp:
         self.connection_lock = threading.Lock()
         self.closing = threading.Event()
         self.connecting = False
+        self.connection_thread = None
+        self.af_running = False
+        self.af_cancel = threading.Event()
+        self.af_queue = queue.Queue()
+        self.af_thread = None
         self.camera_error = None
         self.photo = None
-        self.root.title('探针台试验 · 相机与点动')
+        self.root.title('探针台 V2 试验 · 相机、点动与自动对焦')
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self._build()
         self.root.after(50, self._tick)
@@ -87,16 +109,42 @@ class TrialApp:
         self.camera_index = tk.StringVar(value='0')
         self.backend = tk.StringVar(value='DSHOW' if sys.platform == 'win32' else 'ANY')
         ttk.Label(top, text='相机编号').pack(side='left')
-        ttk.Entry(top, textvariable=self.camera_index, width=4).pack(side='left', padx=4)
-        ttk.Combobox(top, textvariable=self.backend, values=tuple(BACKENDS), state='readonly', width=7).pack(side='left')
+        self.camera_entry = ttk.Entry(top, textvariable=self.camera_index, width=4)
+        self.camera_entry.pack(side='left', padx=4)
+        self.backend_combo = ttk.Combobox(top, textvariable=self.backend, values=tuple(BACKENDS), state='readonly', width=7)
+        self.backend_combo.pack(side='left')
         self.camera_button = ttk.Button(top, text='打开相机', command=self.open_camera)
         self.camera_button.pack(side='left', padx=5)
-        ttk.Button(top, text='关闭相机', command=self.close_camera).pack(side='left')
+        self.close_camera_button = ttk.Button(top, text='关闭相机', command=self.close_camera)
+        self.close_camera_button.pack(side='left')
         ttk.Label(top, text='控制器串口').pack(side='left', padx=(18, 3))
         self.port = tk.StringVar()
-        ttk.Entry(top, textvariable=self.port, width=14).pack(side='left')
+        self.port_entry = ttk.Entry(top, textvariable=self.port, width=14)
+        self.port_entry.pack(side='left')
         self.connect_button = ttk.Button(top, text='连接控制器', command=self.connect)
         self.connect_button.pack(side='left', padx=5)
+
+        autofocus = ttk.LabelFrame(self.root, text='Z 轴自动对焦 · 单位为脉冲', padding=6)
+        autofocus.pack(fill='x', padx=8, pady=(0, 8))
+        self.af_values = {}
+        self.af_entries = []
+        for column, (name, label, default) in enumerate((
+            ('half_range', '半范围 ±', '20'), ('coarse_step', '粗扫步长', '5'),
+            ('fine_step', '细扫步长', '1'), ('speed', '速度 %', '10'),
+            ('settle_seconds', '停稳秒数', '0.5'), ('frames', '每点帧数', '5'),
+        )):
+            ttk.Label(autofocus, text=label).grid(row=0, column=column, sticky='w', padx=4)
+            variable = tk.StringVar(value=default)
+            entry = ttk.Entry(autofocus, textvariable=variable, width=9)
+            entry.grid(row=1, column=column, padx=4, sticky='w')
+            self.af_values[name] = variable
+            self.af_entries.append(entry)
+        self.af_button = ttk.Button(autofocus, text='开始自动对焦', command=self.start_autofocus)
+        self.af_button.grid(row=0, column=6, rowspan=2, padx=12)
+        self.af_status = tk.StringVar(value='先确认手动方向、选择样品区域，再启动有界 Z 扫描。')
+        ttk.Label(autofocus, textvariable=self.af_status, wraplength=1050).grid(
+            row=2, column=0, columnspan=7, sticky='w', pady=(5, 0),
+        )
 
         content = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         content.pack(fill='both', expand=True)
@@ -133,10 +181,12 @@ class TrialApp:
         ttk.Label(right, text='软件急停作用于所有轴，请确保物理急停可用。', wraplength=350).pack(anchor='w')
 
     def _arm(self, _event=None):
-        if self.jog is not None and not self.jog._cancel.is_set():
+        if self.jog is not None and not self.jog._cancel.is_set() and not self.af_running:
             self.jog._set_armed(True)
 
     def open_camera(self):
+        if self.af_running:
+            return
         if self.stream.running:
             self.camera_status.set('相机正在运行或关闭，请稍候')
             return
@@ -167,6 +217,8 @@ class TrialApp:
         self.stream.start(index, backend, prepare=prepare)
 
     def close_camera(self):
+        if self.af_running:
+            return
         if self.stream.running:
             self.stream.stop(timeout=0)
             self.camera_status.set('正在关闭相机…')
@@ -179,7 +231,7 @@ class TrialApp:
         self._draw_plot()
 
     def connect(self):
-        if self.connecting or self.controller is not None:
+        if self.af_running or self.connecting or self.controller is not None:
             return
         port = self.port.get().strip()
         if not port:
@@ -208,14 +260,141 @@ class TrialApp:
                 else:
                     self.connection_queue.put((controller, None))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.connection_thread = threading.Thread(target=worker, daemon=True)
+        self.connection_thread.start()
 
     def stop(self):
+        self.af_cancel.set()
         if self.jog is not None:
             self.jog._request_stop()
 
+    def _refresh_controls(self):
+        locked = self.af_running or self.closing.is_set()
+        for widget in (*self.af_entries, self.camera_entry):
+            widget.configure(state='disabled' if locked else 'normal')
+        self.backend_combo.configure(state='disabled' if locked else 'readonly')
+        self.port_entry.configure(state='disabled' if locked or self.controller is not None else 'normal')
+        self.camera_button.configure(state='disabled' if locked or self.stream.running else 'normal')
+        self.close_camera_button.configure(state='disabled' if locked else 'normal')
+        self.connect_button.configure(
+            state='disabled' if locked or self.connecting or self.controller is not None else 'normal',
+        )
+        ready = (not locked and self.controller is not None and self.jog is not None
+                 and not self.jog._cancel.is_set() and not self.af_cancel.is_set()
+                 and self.stream.active and self.stream.latest() is not None and self.roi is not None)
+        self.af_button.configure(state='normal' if ready else 'disabled')
+
+    def start_autofocus(self):
+        if self.af_running or self.closing.is_set():
+            return
+        if (self.controller is None or self.jog is None or self.jog._cancel.is_set()
+                or self.af_cancel.is_set()):
+            self.af_status.set('请先连接控制器。停止锁定后需重启程序。')
+            return
+        if self.jog._move is not None or self.jog._stop is not None:
+            self.af_status.set('请等待当前手动点动完成。')
+            return
+        frame = self.stream.latest()
+        if not self.stream.active or frame is None or self.roi is None:
+            self.af_status.set('请先打开相机并选择样品区域。')
+            return
+        try:
+            self.roi.validate_shape(frame.image.shape)
+            values = {name: (float(variable.get()) if name == 'settle_seconds' else int(variable.get()))
+                      for name, variable in self.af_values.items()}
+            config = AutofocusConfig(**values)
+        except (ValueError, TypeError) as exc:
+            self.af_status.set(f'参数无效：{exc}')
+            return
+
+        self.af_running = True
+        self.jog._set_armed(False)
+        self.drag_start = None
+        self.preview.delete('drag')
+        self.af_status.set('正在读取当前 Z，准备确认扫描范围…')
+        self._refresh_controls()
+        roi = self.roi
+        expected_shape = frame.image.shape
+
+        def prepare():
+            try:
+                state = self.controller.read_axis_state('Z')
+                if state['running']:
+                    raise StageControllerError('Z 轴仍在运动，请停稳后再启动')
+                if type(state['position']) is not int:
+                    raise StageControllerError('控制器返回了无效 Z 位置')
+                self.af_queue.put(('prepared', (state['position'], roi, config, expected_shape)))
+            except Exception as exc:
+                self.af_queue.put(('error', str(exc)))
+
+        self.af_thread = threading.Thread(target=prepare, daemon=True)
+        self.af_thread.start()
+
+    def _finish_autofocus(self, message):
+        self.af_running = False
+        self.af_status.set(message)
+        self._refresh_controls()
+
+    def _poll_autofocus(self):
+        while True:
+            try:
+                kind, payload = self.af_queue.get_nowait()
+            except queue.Empty:
+                return
+            if kind == 'prepared':
+                if self.closing.is_set() or self.af_cancel.is_set():
+                    self._finish_autofocus('自动对焦已取消。重启程序后可继续运动。')
+                    continue
+                position, roi, config, expected_shape = payload
+                approved = messagebox.askyesno(
+                    '确认 Z 轴自动对焦范围',
+                    f'当前控制器 Z 计数为 {position}。\n'
+                    f'扫描范围为 [{position - config.half_range}, {position + config.half_range}] 脉冲。\n'
+                    '请确认整个范围内探针与样品有安全间隙，物理急停可用。\n是否开始扫描？',
+                    parent=self.root,
+                )
+                if not approved or self.closing.is_set() or self.af_cancel.is_set():
+                    self._finish_autofocus('本次扫描已取消。')
+                    continue
+                latest = self.stream.latest()
+                if not self.stream.active or latest is None or latest.image.shape != expected_shape:
+                    self.stop()
+                    self._finish_autofocus('相机状态或画面尺寸改变，本次扫描已取消。')
+                    continue
+                self.af_status.set('自动对焦正在启动…')
+
+                def worker():
+                    try:
+                        result = run_autofocus(
+                            self.controller, self.stream, roi, config, self.af_cancel,
+                            progress=lambda event, data: self.af_queue.put((event, data)),
+                            expected_start=position, expected_shape=expected_shape,
+                        )
+                        self.af_queue.put(('result', result))
+                    except Exception as exc:
+                        self.af_cancel.set()
+                        self.af_queue.put(('error', str(exc)))
+
+                self.af_thread = threading.Thread(target=worker, daemon=True)
+                self.af_thread.start()
+            elif kind == 'result':
+                message = f'{payload.status} · {payload.message}'
+                if payload.status != 'verified':
+                    self.af_cancel.set()
+                    if self.jog is not None:
+                        self.jog._cancel.set()
+                    message += ' 运动已锁定，重启程序后继续。'
+                self._finish_autofocus(message)
+            elif kind == 'error':
+                self.stop()
+                self._finish_autofocus(f'自动对焦失败：{payload}。重启程序后可继续运动。')
+            elif kind == 'status':
+                self.af_status.set(str(payload))
+            elif kind == 'measurement':
+                self.af_status.set(f'已采样 Z={payload.z:g}，共 {len(payload.frames)} 帧；自动对焦继续中…')
+
     def _drag_start(self, event):
-        if self.display_size is not None:
+        if not self.af_running and self.display_size is not None:
             self.drag_start = (event.x, event.y)
 
     def _drag_move(self, event):
@@ -225,6 +404,8 @@ class TrialApp:
         self.preview.create_rectangle(*self.drag_start, event.x, event.y, outline='#ffcf4a', tags='drag')
 
     def _drag_end(self, event):
+        if self.af_running:
+            return
         if self.drag_start is None or self.display_size is None or self.shape is None:
             return
         dw, dh = self.display_size
@@ -283,6 +464,9 @@ class TrialApp:
     def _show_frame(self, frame):
         height, width = frame.image.shape[:2]
         if self.shape != (height, width):
+            if self.af_running:
+                self.stop()
+                self.af_status.set('相机画面尺寸改变，已停止自动对焦。')
             self.shape = (height, width)
             self.roi = ROI(width // 3, height // 3, width - 2 * (width // 3), height - 2 * (height // 3))
             self.history.clear()
@@ -308,7 +492,15 @@ class TrialApp:
         self._draw_roi()
 
     def _tick(self):
+        self._poll_autofocus()
         if self.closing.is_set():
+            connecting = self.connection_thread is not None and self.connection_thread.is_alive()
+            focusing = self.af_thread is not None and self.af_thread.is_alive()
+            jog_busy = self.jog is not None and (self.jog._move is not None or self.jog._stop is not None)
+            if not connecting and not focusing and not jog_busy:
+                self.root.quit()
+            else:
+                self.root.after(50, self._tick)
             return
         try:
             controller, error = self.connection_queue.get_nowait()
@@ -321,15 +513,19 @@ class TrialApp:
                 self.connect_button.configure(state='normal')
             else:
                 self.controller = controller
-                self.jog = EmbeddedJog(self.root, self.motor_status, controller, self.jog_target)
+                self.jog = EmbeddedJog(
+                    self.root, self.motor_status, controller, self.jog_target,
+                    blocked=lambda: self.af_running or self.closing.is_set(),
+                    on_stop=self.af_cancel.set, on_exit=self.close,
+                )
                 self.root.protocol('WM_DELETE_WINDOW', self.close)
                 self.motor_status.set('已连接。松开移动键，再点击启用点动')
                 self.jog._poll()
         if self.stream.error and self.camera_error != self.stream.error:
             self.camera_error = self.stream.error
             self.camera_status.set(f'相机错误：{self.camera_error}')
-        if not self.stream.running:
-            self.camera_button.configure(state='normal')
+            if self.af_running:
+                self.stop()
         frame = self.stream.latest()
         if self.stream.active and frame is not None and frame.sequence != self.last_sequence:
             try:
@@ -338,7 +534,10 @@ class TrialApp:
                 self.camera_status.set(self.exposure_status or '相机已打开')
             except (ValueError, cv2.error, tk.TclError) as exc:
                 self.camera_status.set(f'画面错误：{exc}')
+                if self.af_running:
+                    self.stop()
                 self.stream.stop(timeout=0)
+        self._refresh_controls()
         self.root.after(50, self._tick)
 
     def close(self):
@@ -352,12 +551,11 @@ class TrialApp:
                 if controller is not None:
                     controller.close()
         self.stream.stop(timeout=0)
-        if self.jog is not None:
-            self.jog._request_exit()
-        else:
-            self.root.quit()
+        self.stop()
 
     def finish(self):
+        if self.af_thread is not None:
+            self.af_thread.join()
         self.stream.stop(timeout=0.1)
         if self.jog is not None:
             self.jog._workers.shutdown(wait=True)

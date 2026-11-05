@@ -1,7 +1,4 @@
-"""Independent, experimental sample-surface focus measurement tools.
-
-This package records and evaluates evidence; it does not move the stage.
-"""
+"""Experimental sample-surface focus measurement, analysis and bounded Z search."""
 
 from .models import ROI
 
